@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evidence-engine"
+version = "0.1.0"
+description = "A teaching implementation of Evidence as Code"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=44.0,<47.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<10.0",
+]
+
+[project.scripts]
+evidence-engine = "evidence_engine.collect:main"
+
+[tool.setuptools.packages.find]
+include = ["evidence_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

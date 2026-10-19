@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local signing keys must never be committed
+keys/
+*.pem
+*.key
+
+# Generated evidence from local experiments
+evidence/
