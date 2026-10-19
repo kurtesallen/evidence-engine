@@ -33,11 +33,32 @@ def create_bundle(tmp_path):
 
 
 def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
+    import json
+
+    registry_path = output / "trust_registry.json"
+
+    registry = {
+        "schema_version": "1.0",
+        "keys": [
+            {
+                "key_id": key_id,
+                "public_key": str(public_key.resolve()),
+                "status": "active",
+                "allowed_sources": ["local-claimed"],
+            }
+        ],
+    }
+
+    registry_path.write_text(
+        json.dumps(registry),
+        encoding="utf-8",
+    )
+
     return verify_bundle(
         artifacts,
         output / "manifest.json",
         output / "manifest.sig",
-        public_key,
+        registry_path,
         key_id,
     )
 

@@ -8,6 +8,7 @@ from evidence_engine.canonical import (
     canonical_json_bytes,
     parse_json_strict,
 )
+from evidence_engine.trust import resolve_trusted_key
 from evidence_engine.collect import provenance_for
 from evidence_engine.manifest import write_manifest, sha256_file
 from evidence_engine.schema import validate_manifest
@@ -41,26 +42,31 @@ def verify_bundle(
     artifacts: Path,
     manifest_path: Path,
     signature_path: Path,
-    public_key: Path,
+    trust_registry: Path,
     expected_key_id: str,
 ) -> bool:
     try:
         manifest_bytes = manifest_path.read_bytes()
         signature = signature_path.read_bytes()
 
-        # Reject noncanonical signed JSON rather than silently normalizing it.
         manifest = parse_json_strict(manifest_bytes)
 
         if canonical_json_bytes(manifest) != manifest_bytes:
             print("FAIL: manifest is not canonical JSON")
             return False
 
-        # Validate the signed data before using any of its fields.
         validate_manifest(manifest)
 
         if manifest["key_id"] != expected_key_id:
             print("FAIL: unexpected signing key ID")
             return False
+
+        # Resolve the public key using independently configured policy.
+        public_key = resolve_trusted_key(
+            trust_registry,
+            expected_key_id,
+            manifest["provenance"]["source"],
+        )
 
         if not verify_bytes(public_key, manifest_bytes, signature):
             print("FAIL: manifest signature is invalid")
@@ -76,7 +82,10 @@ def verify_bundle(
                 return False
 
             if not path.is_file():
-                print(f"FAIL: unexpected directory or special entry: {path.name}")
+                print(
+                    "FAIL: unexpected directory or special entry: "
+                    f"{path.name}"
+                )
                 return False
 
             actual_names.add(path.name)
@@ -97,7 +106,8 @@ def verify_bundle(
                 return False
 
         print("PASS: manifest is canonical and schema-valid")
-        print(f"PASS: signature verified with expected key ID {expected_key_id}")
+        print(f"PASS: trusted key authorized: {expected_key_id}")
+        print("PASS: manifest signature verified")
         print(f"PASS: verified {len(entries)} required artifacts")
         return True
 
@@ -119,7 +129,11 @@ def main() -> None:
     verify_parser.add_argument("--artifacts", type=Path, required=True)
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--signature", type=Path, required=True)
-    verify_parser.add_argument("--public-key", type=Path, required=True)
+    verify_parser.add_argument(
+    "--trust-registry",
+    type=Path,
+    default=Path("config/trust_registry.json"),
+)
     verify_parser.add_argument("--expected-key-id", required=True)
 
     args = parser.parse_args()
@@ -133,7 +147,7 @@ def main() -> None:
             args.artifacts,
             args.manifest,
             args.signature,
-            args.public_key,
+            args.trust_registry,
             args.expected_key_id,
         )
         if not success:

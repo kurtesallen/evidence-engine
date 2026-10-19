@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "keys": [
+    {
+      "key_id": "local-dev-2026-01",
+      "public_key": "../keys/public.pem",
+      "status": "active",
+      "allowed_sources": [
+        "local-claimed"
+      ]
+    }
+  ]
+}
