@@ -41,7 +41,10 @@ def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
                 "key_id": key_id,
                 "public_key": "../public.pem",
                 "status": "active",
-                "allowed_sources": ["local-claimed"],
+                "allowed_sources": [
+                    "local-claimed",
+                    "github-actions-claimed",
+                ],
             }
         ],
     }
