@@ -1,0 +1,86 @@
+name: EvidenceEngine CI
+
+on: 
+  push: 
+  pull_request: 
+  workflow_dispatch:
+
+permissions: 
+  contents: read
+
+concurrency:
+  group: evidence-engine-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  test:
+    name: Test and validate provenance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: python -m pytest -v
+
+      - name: Verify checked-out commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checked-out commit does not match GitHub event SHA"
+            exit 1
+          fi
+
+          echo "Verified checked-out commit: $ACTUAL_SHA"
+
+      - name: Capture CI context
+        env:
+          GITHUB_ACTIONS: "true"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from evidence_engine.ci_provenance import capture_ci_context
+
+          context = capture_ci_context()
+          output = Path("ci-context.json")
+          output.write_text(
+              json.dumps(context, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print("Captured CI context:", output)
+          PY
+
+      - name: Upload CI context for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-context-${{ github.run_id }}
+          path: ci-context.json
+          if-no-files-found: error
+          retention-days: 7
