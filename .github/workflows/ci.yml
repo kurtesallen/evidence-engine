@@ -7,6 +7,8 @@ on:
 
 permissions: 
   contents: read
+  id-token: write
+  attestations: write
 
 concurrency:
   group: evidence-engine-${{ github.workflow }}-${{ github.ref }}
@@ -84,3 +86,8 @@ jobs:
           path: ci-context.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: pyproject.toml
