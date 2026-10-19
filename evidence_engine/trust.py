@@ -14,19 +14,33 @@ ALLOWED_SOURCES = {
     "github-actions-claimed",
 }
 
+REGISTRY_FIELDS = {"schema_version", "keys"}
+KEY_ENTRY_FIELDS = {
+    "key_id",
+    "public_key",
+    "status",
+    "allowed_sources",
+}
+
 
 def load_trust_registry(registry_path: Path) -> dict[str, Any]:
     """Load a trust registry and reject malformed structures."""
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(
+            registry_path.read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cannot load trust registry: {exc}") from exc
+        raise ValueError(
+            f"Cannot load trust registry: {exc}"
+        ) from exc
 
     if not isinstance(registry, dict):
         raise ValueError("Trust registry must be a JSON object")
 
-    if set(registry) != {"schema_version", "keys"}:
-        raise ValueError("Trust registry has missing or unknown fields")
+    if set(registry) != REGISTRY_FIELDS:
+        raise ValueError(
+            "Trust registry has missing or unknown fields"
+        )
 
     if registry["schema_version"] != "1.0":
         raise ValueError("Unsupported trust registry schema")
@@ -36,38 +50,54 @@ def load_trust_registry(registry_path: Path) -> dict[str, Any]:
     if not isinstance(entries, list):
         raise ValueError("Trust registry keys must be a list")
 
-    seen_ids = set()
+    seen_ids: set[str] = set()
 
     for entry in entries:
         if not isinstance(entry, dict):
-            raise ValueError("Trust registry key entry must be an object")
+            raise ValueError(
+                "Trust registry key entry must be an object"
+            )
 
-        if set(entry) != {
-            "key_id",
-            "public_key",
-            "status",
-            "allowed_sources",
-        }:
-            raise ValueError("Trust registry key has missing or unknown fields")
+        if set(entry) != KEY_ENTRY_FIELDS:
+            raise ValueError(
+                "Trust registry key has missing or unknown fields"
+            )
 
         key_id = entry["key_id"]
         public_key = entry["public_key"]
         status = entry["status"]
         allowed_sources = entry["allowed_sources"]
 
-        if not isinstance(key_id, str) or not key_id or len(key_id) > 128:
+        if (
+            not isinstance(key_id, str)
+            or not key_id
+            or len(key_id) > 128
+        ):
             raise ValueError("Invalid trust registry key ID")
 
         if key_id in seen_ids:
-            raise ValueError(f"Duplicate trust registry key ID: {key_id}")
+            raise ValueError(
+                f"Duplicate trust registry key ID: {key_id}"
+            )
 
         seen_ids.add(key_id)
 
-        if not isinstance(public_key, str) or not public_key:
-            raise ValueError(f"Invalid public key path: {key_id}")
+        if not isinstance(public_key, str) or not public_key.strip():
+            raise ValueError(
+                f"Invalid public key path: {key_id}"
+            )
 
-        if status not in ALLOWED_STATUSES:
-            raise ValueError(f"Invalid key status: {key_id}")
+        # Require relative paths. Absolute paths must never be
+        # accepted as registry-controlled public-key locations.
+        if Path(public_key).is_absolute():
+            raise ValueError(
+                f"Public key path must be relative: {key_id}"
+            )
+
+        if not isinstance(status, str) or status not in ALLOWED_STATUSES:
+            raise ValueError(
+                f"Invalid key status: {key_id}"
+            )
 
         if (
             not isinstance(allowed_sources, list)
@@ -78,7 +108,9 @@ def load_trust_registry(registry_path: Path) -> dict[str, Any]:
             )
             or len(allowed_sources) != len(set(allowed_sources))
         ):
-            raise ValueError(f"Invalid allowed_sources: {key_id}")
+            raise ValueError(
+                f"Invalid allowed_sources: {key_id}"
+            )
 
     return registry
 
@@ -92,7 +124,8 @@ def resolve_trusted_key(
     registry = load_trust_registry(registry_path)
 
     matches = [
-        entry for entry in registry["keys"]
+        entry
+        for entry in registry["keys"]
         if entry["key_id"] == key_id
     ]
 
@@ -105,22 +138,46 @@ def resolve_trusted_key(
         raise ValueError("Signing key is not active")
 
     if source not in entry["allowed_sources"]:
-        raise ValueError("Signing key is not authorized for this source")
+        raise ValueError(
+            "Signing key is not authorized for this source"
+        )
 
     registry_dir = registry_path.resolve().parent
-    public_key_path = (registry_dir / entry["public_key"]).resolve()
+    configured_key_path = Path(entry["public_key"])
 
-    # Keep key files within the project directory containing the registry.
-    if not public_key_path.is_relative_to(registry_dir.parent):
-        raise ValueError("Public key path escapes the configured project")
+    # Recheck the path here so this function remains defensive
+    # if registry validation changes in the future.
+    if configured_key_path.is_absolute():
+        raise ValueError(
+            "Trusted public key path must be relative"
+        )
+
+    public_key_path = (
+        registry_dir / configured_key_path
+    ).resolve()
+
+    # Keep resolved key files within the project directory
+    # containing the trust registry, including against symlink escapes.
+    project_dir = registry_dir.parent.resolve()
+
+    if not public_key_path.is_relative_to(project_dir):
+        raise ValueError(
+            "Public key path escapes the configured project"
+        )
 
     if not public_key_path.is_file():
-        raise ValueError("Trusted public key file does not exist")
+        raise ValueError(
+            "Trusted public key file does not exist"
+        )
 
     try:
-        key = serialization.load_pem_public_key(public_key_path.read_bytes())
-    except (OSError, ValueError) as exc:
-        raise ValueError("Trusted public key cannot be loaded") from exc
+        key = serialization.load_pem_public_key(
+            public_key_path.read_bytes()
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(
+            "Trusted public key cannot be loaded"
+        ) from exc
 
     if not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048:
         raise ValueError("Trusted key must be RSA-2048")

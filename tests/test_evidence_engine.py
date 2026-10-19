@@ -1,5 +1,5 @@
 import json
-
+import subprocess
 import pytest
 
 from evidence_engine.canonical import (
@@ -26,15 +26,12 @@ def create_bundle(tmp_path):
 
     generate_key_pair(private_key, public_key)
     collect(artifacts)
-
     seal(artifacts, output, private_key)
 
     return artifacts, output, private_key, public_key
 
 
 def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
-    import json
-
     registry_path = output / "trust_registry.json"
 
     registry = {
@@ -42,17 +39,14 @@ def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
         "keys": [
             {
                 "key_id": key_id,
-                "public_key": str(public_key.resolve()),
+                "public_key": "../public.pem",
                 "status": "active",
                 "allowed_sources": ["local-claimed"],
             }
         ],
     }
 
-    registry_path.write_text(
-        json.dumps(registry),
-        encoding="utf-8",
-    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
 
     return verify_bundle(
         artifacts,
@@ -78,23 +72,22 @@ def test_duplicate_json_keys_are_rejected():
 def test_noncanonical_manifest_bytes_are_rejected(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
 
-    path = output / "manifest.json"
-    path.write_bytes(path.read_bytes() + b"\n")
+    manifest_path = output / "manifest.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
 
     assert not check_bundle(artifacts, output, public_key)
 
 
 def test_valid_bundle_passes(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
-
     assert check_bundle(artifacts, output, public_key)
 
 
 def test_tampered_artifact_fails(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
 
-    path = artifacts / "plan.json"
-    path.write_bytes(path.read_bytes() + b"TAMPERED")
+    artifact_path = artifacts / "plan.json"
+    artifact_path.write_bytes(artifact_path.read_bytes() + b"TAMPERED")
 
     assert not check_bundle(artifacts, output, public_key)
 
@@ -119,7 +112,10 @@ def test_wrong_key_id_fails(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
 
     assert not check_bundle(
-        artifacts, output, public_key, key_id="untrusted-key"
+        artifacts,
+        output,
+        public_key,
+        key_id="untrusted-key",
     )
 
 
@@ -151,8 +147,45 @@ def test_manifest_rejects_missing_required_artifact(tmp_path):
 
 def test_manifest_rejects_unknown_field(tmp_path):
     artifacts, output, _, _ = create_bundle(tmp_path)
+
     manifest = json.loads((output / "manifest.json").read_bytes())
     manifest["unrecognized_field"] = True
 
-    with pytest.raises(ValueError, match="unknown top-level fields"):
+    with pytest.raises(ValueError, match="missing or unknown top-level fields"):
         validate_manifest(manifest)
+
+
+def test_ci_sealing_rejects_checkout_commit_mismatch(tmp_path, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    output = tmp_path / "sealed"
+    private_key = tmp_path / "private.pem"
+    public_key = tmp_path / "public.pem"
+
+    artifacts.mkdir()
+    generate_key_pair(private_key, public_key)
+
+    for name in ("plan.json", "state.json", "commit.txt", "version.txt"):
+        (artifacts / name).write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example-org/evidence-engine")
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "123456789")
+    monkeypatch.setenv(
+        "GITHUB_WORKFLOW_REF",
+        "example-org/evidence-engine/.github/workflows/ci.yml@refs/heads/main",
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="b" * 40 + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="does not match checked-out Git commit"):
+        seal(artifacts, output, private_key)
