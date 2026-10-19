@@ -1,13 +1,13 @@
-"""Create SHA-256 manifests for evidence artifacts."""
+"""Build and serialize EvidenceEngine manifest v1.1."""
 
 import hashlib
 from pathlib import Path
 
 from evidence_engine.canonical import canonical_json_bytes
+from evidence_engine.schema import validate_manifest
 
 
 def sha256_file(path: Path) -> str:
-    """Hash the exact bytes of a file."""
     digest = hashlib.sha256()
 
     with path.open("rb") as stream:
@@ -17,10 +17,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_manifest(artifact_dir: Path) -> dict:
-    """Build a manifest from regular files in one artifact directory."""
+def build_manifest(
+    artifact_dir: Path,
+    provenance: dict,
+    key_id: str,
+) -> dict:
     if not artifact_dir.is_dir():
-        raise ValueError(f"Artifact directory does not exist: {artifact_dir}")
+        raise ValueError("Artifact directory does not exist")
 
     artifacts = []
 
@@ -29,7 +32,7 @@ def build_manifest(artifact_dir: Path) -> dict:
             raise ValueError(f"Symlinks are not allowed: {path.name}")
 
         if not path.is_file():
-            continue
+            raise ValueError(f"Unexpected directory or special entry: {path.name}")
 
         artifacts.append(
             {
@@ -41,19 +44,26 @@ def build_manifest(artifact_dir: Path) -> dict:
             }
         )
 
-    if not artifacts:
-        raise ValueError("Cannot create an empty evidence manifest")
-
-    return {
-        "schema_version": "1.0",
+    manifest = {
+        "schema_version": "1.1",
         "hash_algorithm": "SHA-256",
+        "signature_algorithm": "RSA-PSS-SHA256",
+        "key_id": key_id,
+        "provenance": provenance,
         "artifacts": artifacts,
     }
 
+    validate_manifest(manifest)
+    return manifest
 
-def write_manifest(artifact_dir: Path, destination: Path) -> dict:
-    """Write canonical manifest bytes to a separate destination."""
-    manifest = build_manifest(artifact_dir)
+
+def write_manifest(
+    artifact_dir: Path,
+    destination: Path,
+    provenance: dict,
+    key_id: str,
+) -> dict:
+    manifest = build_manifest(artifact_dir, provenance, key_id)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(canonical_json_bytes(manifest))

@@ -9,6 +9,7 @@ description = "A teaching implementation of Evidence as Code"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=44.0,<47.0",
+     "rfc8785>=0.1.4,<0.2",
 ]
 
 [project.optional-dependencies]

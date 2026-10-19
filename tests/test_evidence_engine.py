@@ -1,14 +1,45 @@
 import json
 
-from evidence_engine.canonical import canonical_json_bytes
-from evidence_engine.collect import collect
+import pytest
+
+from evidence_engine.canonical import (
+    canonical_json_bytes,
+    parse_json_strict,
+)
+from evidence_engine.collect import collect, provenance_for
 from evidence_engine.manifest import build_manifest
+from evidence_engine.schema import validate_manifest
 from evidence_engine.signing import (
+    KEY_ID,
     generate_key_pair,
     sign_bytes,
     verify_bytes,
 )
 from evidence_engine.verify import seal, verify_bundle
+
+
+def create_bundle(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    output = tmp_path / "sealed"
+    private_key = tmp_path / "private.pem"
+    public_key = tmp_path / "public.pem"
+
+    generate_key_pair(private_key, public_key)
+    collect(artifacts)
+
+    seal(artifacts, output, private_key)
+
+    return artifacts, output, private_key, public_key
+
+
+def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
+    return verify_bundle(
+        artifacts,
+        output / "manifest.json",
+        output / "manifest.sig",
+        public_key,
+        key_id,
+    )
 
 
 def test_canonical_json_is_deterministic():
@@ -18,96 +49,89 @@ def test_canonical_json_is_deterministic():
     assert canonical_json_bytes(first) == canonical_json_bytes(second)
 
 
-def test_signature_round_trip(tmp_path):
-    private_key = tmp_path / "private.pem"
-    public_key = tmp_path / "public.pem"
-
-    generate_key_pair(private_key, public_key)
-
-    message = b"EvidenceEngine test message"
-    signature = sign_bytes(private_key, message)
-
-    assert verify_bytes(public_key, message, signature)
-    assert not verify_bytes(
-        public_key,
-        b"Modified message",
-        signature,
-    )
+def test_duplicate_json_keys_are_rejected():
+    with pytest.raises(ValueError, match="Duplicate JSON key"):
+        parse_json_strict(b'{"key": 1, "key": 2}')
 
 
-def test_manifest_hashes_exact_file_bytes(tmp_path):
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
+def test_noncanonical_manifest_bytes_are_rejected(tmp_path):
+    artifacts, output, _, public_key = create_bundle(tmp_path)
 
-    artifact = artifacts / "example.txt"
-    artifact.write_bytes(b"original\n")
+    path = output / "manifest.json"
+    path.write_bytes(path.read_bytes() + b"\n")
 
-    original = build_manifest(artifacts)
-    artifact.write_bytes(b"modified\n")
-    modified = build_manifest(artifacts)
-
-    assert original["artifacts"][0]["sha256"] != (
-        modified["artifacts"][0]["sha256"]
-    )
+    assert not check_bundle(artifacts, output, public_key)
 
 
 def test_valid_bundle_passes(tmp_path):
-    artifacts = tmp_path / "artifacts"
-    output = tmp_path / "sealed"
-    private_key = tmp_path / "private.pem"
-    public_key = tmp_path / "public.pem"
+    artifacts, output, _, public_key = create_bundle(tmp_path)
 
-    generate_key_pair(private_key, public_key)
-    collect(artifacts)
-    seal(artifacts, output, private_key)
-
-    assert verify_bundle(
-        artifacts,
-        output / "manifest.json",
-        output / "manifest.sig",
-        public_key,
-    )
+    assert check_bundle(artifacts, output, public_key)
 
 
 def test_tampered_artifact_fails(tmp_path):
-    artifacts = tmp_path / "artifacts"
-    output = tmp_path / "sealed"
+    artifacts, output, _, public_key = create_bundle(tmp_path)
+
+    path = artifacts / "plan.json"
+    path.write_bytes(path.read_bytes() + b"TAMPERED")
+
+    assert not check_bundle(artifacts, output, public_key)
+
+
+def test_extra_artifact_fails(tmp_path):
+    artifacts, output, _, public_key = create_bundle(tmp_path)
+
+    (artifacts / "unexpected.txt").write_text("extra", encoding="utf-8")
+
+    assert not check_bundle(artifacts, output, public_key)
+
+
+def test_missing_artifact_fails(tmp_path):
+    artifacts, output, _, public_key = create_bundle(tmp_path)
+
+    (artifacts / "state.json").unlink()
+
+    assert not check_bundle(artifacts, output, public_key)
+
+
+def test_wrong_key_id_fails(tmp_path):
+    artifacts, output, _, public_key = create_bundle(tmp_path)
+
+    assert not check_bundle(
+        artifacts, output, public_key, key_id="untrusted-key"
+    )
+
+
+def test_signature_rejects_modified_message(tmp_path):
     private_key = tmp_path / "private.pem"
     public_key = tmp_path / "public.pem"
 
     generate_key_pair(private_key, public_key)
-    collect(artifacts)
-    seal(artifacts, output, private_key)
 
-    plan = artifacts / "plan.json"
-    plan.write_bytes(plan.read_bytes() + b"TAMPERED")
+    signature = sign_bytes(private_key, b"original")
 
-    assert not verify_bundle(
-        artifacts,
-        output / "manifest.json",
-        output / "manifest.sig",
-        public_key,
-    )
+    assert verify_bytes(public_key, b"original", signature)
+    assert not verify_bytes(public_key, b"modified", signature)
 
 
-def test_tampered_manifest_fails_signature(tmp_path):
+def test_manifest_rejects_missing_required_artifact(tmp_path):
     artifacts = tmp_path / "artifacts"
-    output = tmp_path / "sealed"
-    private_key = tmp_path / "private.pem"
-    public_key = tmp_path / "public.pem"
+    artifacts.mkdir()
 
-    generate_key_pair(private_key, public_key)
-    collect(artifacts)
-    seal(artifacts, output, private_key)
+    (artifacts / "plan.json").write_text("{}", encoding="utf-8")
 
-    manifest_path = output / "manifest.json"
-    manifest = json.loads(manifest_path.read_bytes())
-    manifest["schema_version"] = "999"
-    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    with pytest.raises(ValueError, match="Artifact set mismatch"):
+        build_manifest(
+            artifacts,
+            provenance_for(tmp_path),
+            KEY_ID,
+        )
 
-    assert not verify_bundle(
-        artifacts,
-        manifest_path,
-        output / "manifest.sig",
-        public_key,
-    )
+
+def test_manifest_rejects_unknown_field(tmp_path):
+    artifacts, output, _, _ = create_bundle(tmp_path)
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    manifest["unrecognized_field"] = True
+
+    with pytest.raises(ValueError, match="unknown top-level fields"):
+        validate_manifest(manifest)

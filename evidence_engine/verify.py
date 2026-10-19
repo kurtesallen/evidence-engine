@@ -1,39 +1,40 @@
-"""Seal and independently verify an EvidenceEngine bundle."""
+"""Seal and verify hardened EvidenceEngine bundles."""
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-from evidence_engine.canonical import canonical_json_bytes
+from evidence_engine.canonical import (
+    canonical_json_bytes,
+    parse_json_strict,
+)
+from evidence_engine.collect import provenance_for
 from evidence_engine.manifest import write_manifest, sha256_file
-from evidence_engine.signing import sign_bytes, verify_bytes
+from evidence_engine.schema import validate_manifest
+from evidence_engine.signing import (
+    KEY_ID,
+    sign_bytes,
+    verify_bytes,
+)
 
 
-def seal(
-    artifacts: Path,
-    output: Path,
-    private_key: Path,
-) -> None:
-    """Create a manifest and detached signature."""
+def seal(artifacts: Path, output: Path, private_key: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
 
     manifest_path = output / "manifest.json"
     signature_path = output / "manifest.sig"
 
-    manifest = write_manifest(artifacts, manifest_path)
-    manifest_bytes = canonical_json_bytes(manifest)
+    write_manifest(
+        artifacts,
+        manifest_path,
+        provenance_for(Path.cwd()),
+        KEY_ID,
+    )
 
-    # Confirm the stored manifest contains the exact signed bytes.
-    if manifest_path.read_bytes() != manifest_bytes:
-        raise ValueError("Manifest serialization mismatch")
+    signed_bytes = manifest_path.read_bytes()
+    signature_path.write_bytes(sign_bytes(private_key, signed_bytes))
 
-    signature = sign_bytes(private_key, manifest_bytes)
-    signature_path.write_bytes(signature)
-
-    print(f"Manifest: {manifest_path}")
-    print(f"Signature: {signature_path}")
-    print(f"Artifacts: {len(manifest['artifacts'])}")
+    print(f"Sealed {artifacts} with key ID {KEY_ID}")
 
 
 def verify_bundle(
@@ -41,103 +42,72 @@ def verify_bundle(
     manifest_path: Path,
     signature_path: Path,
     public_key: Path,
+    expected_key_id: str,
 ) -> bool:
-    """Verify signature, schema, completeness, and artifact digests."""
-    manifest_bytes = manifest_path.read_bytes()
-    signature = signature_path.read_bytes()
-
-    # First authenticate the exact manifest bytes.
-    if not verify_bytes(public_key, manifest_bytes, signature):
-        print("FAIL: manifest signature is invalid")
-        return False
-
     try:
-        manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        print("FAIL: manifest is not valid JSON")
-        return False
+        manifest_bytes = manifest_path.read_bytes()
+        signature = signature_path.read_bytes()
 
-    # Require the format used by this lesson.
-    if not isinstance(manifest, dict):
-        print("FAIL: manifest must be a JSON object")
-        return False
+        # Reject noncanonical signed JSON rather than silently normalizing it.
+        manifest = parse_json_strict(manifest_bytes)
 
-    if manifest.get("schema_version") != "1.0":
-        print("FAIL: unsupported manifest schema")
-        return False
-
-    if manifest.get("hash_algorithm") != "SHA-256":
-        print("FAIL: unsupported hash algorithm")
-        return False
-
-    entries = manifest.get("artifacts")
-    if not isinstance(entries, list) or not entries:
-        print("FAIL: manifest has no artifacts")
-        return False
-
-    seen_names = set()
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            print("FAIL: malformed artifact entry")
+        if canonical_json_bytes(manifest) != manifest_bytes:
+            print("FAIL: manifest is not canonical JSON")
             return False
 
-        name = entry.get("name")
+        # Validate the signed data before using any of its fields.
+        validate_manifest(manifest)
 
-        # Only accept a plain filename, never a path supplied by a manifest.
-        if (
-            not isinstance(name, str)
-            or not name
-            or Path(name).name != name
-            or name in {".", ".."}
-        ):
-            print("FAIL: invalid artifact name")
+        if manifest["key_id"] != expected_key_id:
+            print("FAIL: unexpected signing key ID")
             return False
 
-        if name in seen_names:
-            print(f"FAIL: duplicate artifact entry: {name}")
+        if not verify_bytes(public_key, manifest_bytes, signature):
+            print("FAIL: manifest signature is invalid")
             return False
 
-        seen_names.add(name)
+        entries = manifest["artifacts"]
+        expected_names = {entry["name"] for entry in entries}
+        actual_names = set()
 
-        path = artifacts / name
+        for path in artifacts.iterdir():
+            if path.is_symlink():
+                print(f"FAIL: symbolic link found: {path.name}")
+                return False
 
-        if path.is_symlink() or not path.is_file():
-            print(f"FAIL: artifact missing or unsafe: {name}")
-            return False
+            if not path.is_file():
+                print(f"FAIL: unexpected directory or special entry: {path.name}")
+                return False
 
-        if path.stat().st_size != entry.get("size_bytes"):
-            print(f"FAIL: size mismatch: {name}")
-            return False
-
-        if sha256_file(path) != entry.get("sha256"):
-            print(f"FAIL: digest mismatch: {name}")
-            return False
-
-    # Reject unlisted regular files: the bundle must match the manifest.
-    actual_names = set()
-
-    for path in artifacts.iterdir():
-        if path.is_symlink():
-            print(f"FAIL: unexpected symlink: {path.name}")
-            return False
-        if path.is_file():
             actual_names.add(path.name)
 
-    if actual_names != seen_names:
-        print("FAIL: artifact set differs from manifest")
-        return False
+        if actual_names != expected_names:
+            print("FAIL: artifact set differs from manifest")
+            return False
 
-    print("PASS: manifest signature is valid")
-    print(f"PASS: verified {len(seen_names)} artifacts")
-    print("PASS: artifact sizes and SHA-256 digests match")
-    return True
+        for entry in entries:
+            path = artifacts / entry["name"]
+
+            if path.stat().st_size != entry["size_bytes"]:
+                print(f"FAIL: size mismatch: {entry['name']}")
+                return False
+
+            if sha256_file(path) != entry["sha256"]:
+                print(f"FAIL: digest mismatch: {entry['name']}")
+                return False
+
+        print("PASS: manifest is canonical and schema-valid")
+        print(f"PASS: signature verified with expected key ID {expected_key_id}")
+        print(f"PASS: verified {len(entries)} required artifacts")
+        return True
+
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"FAIL: verification error: {exc}")
+        return False
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Seal or verify an EvidenceEngine evidence bundle."
-    )
+    parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     seal_parser = subparsers.add_parser("seal")
@@ -150,6 +120,7 @@ def main() -> None:
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--signature", type=Path, required=True)
     verify_parser.add_argument("--public-key", type=Path, required=True)
+    verify_parser.add_argument("--expected-key-id", required=True)
 
     args = parser.parse_args()
 
@@ -163,12 +134,13 @@ def main() -> None:
             args.manifest,
             args.signature,
             args.public_key,
+            args.expected_key_id,
         )
         if not success:
             sys.exit(1)
 
     except (OSError, ValueError, TypeError) as exc:
-        print(f"FAIL: verification or sealing error: {exc}")
+        print(f"FAIL: operation error: {exc}")
         sys.exit(1)
 
 
