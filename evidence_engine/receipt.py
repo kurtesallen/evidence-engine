@@ -6,6 +6,7 @@ from typing import Any
 from evidence_engine.agents.base import Agent, AgentResult
 from evidence_engine.canonical import canonical_json_bytes, parse_json_strict
 from evidence_engine.schema import validate_manifest
+from evidence_engine.verify import verify_bundle
 
 
 class ReceiptAgent(Agent):
@@ -29,7 +30,9 @@ class ReceiptAgent(Agent):
             manifest_bytes = self._manifest_path.read_bytes()
         except OSError as exc:
             return AgentResult(
-                False, None, "manifest-read-failed",
+                False,
+                None,
+                "manifest-read-failed",
                 {"exception": str(exc)},
             )
 
@@ -37,7 +40,9 @@ class ReceiptAgent(Agent):
             signature_bytes = self._signature_path.read_bytes()
         except OSError as exc:
             return AgentResult(
-                False, None, "signature-read-failed",
+                False,
+                None,
+                "signature-read-failed",
                 {"exception": str(exc)},
             )
 
@@ -45,18 +50,25 @@ class ReceiptAgent(Agent):
             manifest = parse_json_strict(manifest_bytes)
         except (ValueError, TypeError) as exc:
             return AgentResult(
-                False, None, "manifest-json-invalid",
+                False,
+                None,
+                "manifest-json-invalid",
                 {"exception": str(exc)},
             )
 
         try:
             if canonical_json_bytes(manifest) != manifest_bytes:
                 return AgentResult(
-                    False, None, "manifest-not-canonical", {},
+                    False,
+                    None,
+                    "manifest-not-canonical",
+                    {},
                 )
         except (ValueError, TypeError) as exc:
             return AgentResult(
-                False, None, "manifest-json-invalid",
+                False,
+                None,
+                "manifest-json-invalid",
                 {"exception": str(exc)},
             )
 
@@ -64,7 +76,9 @@ class ReceiptAgent(Agent):
             validate_manifest(manifest)
         except (ValueError, TypeError, KeyError) as exc:
             return AgentResult(
-                False, None, "manifest-schema-invalid",
+                False,
+                None,
+                "manifest-schema-invalid",
                 {"exception": str(exc)},
             )
 
@@ -78,6 +92,33 @@ class ReceiptAgent(Agent):
                     "expected": self._source,
                     "actual": manifest_source,
                 },
+            )
+
+        # Verify the signature, trusted key, and artifact contents before
+        # issuing receipt metadata. A valid manifest structure alone is
+        # insufficient evidence that the bundle is authentic.
+        try:
+            verified = verify_bundle(
+                self._root,
+                self._manifest_path,
+                self._signature_path,
+                self._trust_registry_path,
+                manifest["key_id"],
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            return AgentResult(
+                False,
+                None,
+                "bundle-verification-error",
+                {"exception": str(exc)},
+            )
+
+        if not verified:
+            return AgentResult(
+                False,
+                None,
+                "bundle-verification-failed",
+                {},
             )
 
         receipt = {

@@ -1,7 +1,11 @@
+from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from evidence_engine.agents.base import AgentResult
 from evidence_engine.agents.orchestrator import Orchestrator
@@ -29,12 +33,54 @@ _DEFAULT_PRIVATE_KEY = object()
 
 def make_artifacts(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
+
     for name in ARTIFACT_NAMES:
         (root / name).write_text(
             f"test data: {name}\n",
             encoding="utf-8",
         )
+
     return root
+
+
+def prepare_signing_and_trust(tmp_path: Path) -> None:
+    """Create a real RSA key pair and an active local trust entry."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+
+    (tmp_path / "private.pem").write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    (tmp_path / "public.pem").write_bytes(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+    (tmp_path / "trust.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "keys": [
+                    {
+                        "key_id": KEY_ID,
+                        "public_key": "public.pem",
+                        "status": "active",
+                        "allowed_sources": ["local-claimed"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def make_orchestrator(
@@ -66,38 +112,10 @@ def make_orchestrator(
     )
 
 
-class FakeSigningAgent:
-    calls = 0
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-    def run(self):
-        type(self).calls += 1
-        assert self.kwargs["manifest_path"].is_file()
-
-        return AgentResult(
-            success=True,
-            data={
-                "signature": b"test-signature",
-                "key_id": KEY_ID,
-                "mode": "local",
-            },
-            error=None,
-            audit={"mode": "local"},
-        )
-
-
 def test_orchestrator_success_creates_bundle_and_receipt(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
-    FakeSigningAgent.calls = 0
-
-    monkeypatch.setattr(
-        "evidence_engine.agents.orchestrator.SigningAgent",
-        FakeSigningAgent,
-    )
+    prepare_signing_and_trust(tmp_path)
 
     agent = make_orchestrator(tmp_path)
     result = agent.run()
@@ -110,9 +128,11 @@ def test_orchestrator_success_creates_bundle_and_receipt(
 
     bundle = tmp_path / "bundle"
     assert (bundle / "manifest.json").is_file()
-    assert (bundle / "manifest.sig").read_bytes() == b"test-signature"
+    assert (bundle / "manifest.sig").is_file()
+    assert (bundle / "manifest.sig").stat().st_size > 0
+
     assert result.data["receipt"]["signature_key_id"] == KEY_ID
-    assert FakeSigningAgent.calls == 1
+    assert result.data["receipt"]["source"] == "local-claimed"
 
 
 @pytest.mark.parametrize(
@@ -291,7 +311,9 @@ def test_orchestrator_rejects_empty_signature(
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "manifest.sig").write_bytes(b"stale-signature")
+
     result = make_orchestrator(tmp_path, output=bundle).run()
+
     assert result.success is False
     assert result.error == "signature-output-invalid"
-    assert not (tmp_path / "bundle" / "manifest.sig").exists()
+    assert not (bundle / "manifest.sig").exists()
