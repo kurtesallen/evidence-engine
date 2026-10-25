@@ -26,12 +26,12 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
           cache: pip
@@ -84,7 +84,7 @@ jobs:
           PY
 
       - name: Upload CI context for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ci-context-${{ github.run_id }}
           path: ci-context.json
@@ -92,6 +92,6 @@ jobs:
           retention-days: 7
 
       - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: pyproject.toml
