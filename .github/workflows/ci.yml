@@ -1,14 +1,13 @@
 name: EvidenceEngine CI
 
-on: 
-  push: 
-  pull_request: 
+on:
+  push:
+  pull_request:
   workflow_dispatch:
 
-permissions: 
+permissions:
   contents: read
-  id-token: write
-  attestations: write
+
 
 concurrency:
   group: evidence-engine-${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +18,11 @@ jobs:
   test:
     name: Test and validate provenance
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     steps:
       - name: Check out source
