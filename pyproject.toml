@@ -7,12 +7,16 @@ name = "evidence-engine"
 version = "0.1.0"
 description = "A teaching implementation of Evidence as Code"
 requires-python = ">=3.11"
+
 dependencies = [
     "cryptography>=44.0,<47.0",
-     "rfc8785>=0.1.4,<0.2",
+    "rfc8785>=0.1.4,<0.2",
 ]
 
 [project.optional-dependencies]
+aws = [
+    "boto3>=1.35,<2.0",
+]
 dev = [
     "pytest>=8.0,<10.0",
 ]

@@ -1,0 +1,49 @@
+name: EvidenceEngine Consumer OIDC Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-aws-identity:
+    name: Verify consumer AWS identity
+    runs-on: ubuntu-latest
+
+    environment:
+      name: evidence-consumer
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: "846470648858"
+          role-session-name: EvidenceEngineConsumer-${{ github.run_id }}
+
+      - name: Verify expected AWS role
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          identity_arn="$(aws sts get-caller-identity \
+            --query Arn \
+            --output text)"
+
+          echo "Authenticated AWS identity: $identity_arn"
+
+          case "$identity_arn" in
+            arn:aws:sts::846470648858:assumed-role/evidence-engine-consumer/*)
+              echo "Consumer role assumption verified."
+              ;;
+            *)
+              echo "Unexpected AWS identity: $identity_arn" >&2
+              exit 1
+              ;;
+          esac

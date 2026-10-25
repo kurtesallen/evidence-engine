@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "keys": [
     {
-      "key_id": "local-dev-2026-01",
-      "public_key": "../keys/public.pem",
+      "key_id": "arn:aws:kms:us-east-1:846470648858:key/a7beadcf-9efc-4a89-ba5b-75e06d2342b8",
+      "public_key": "../keys/kms-public.pem",
       "status": "active",
       "allowed_sources": [
         "local-claimed"
