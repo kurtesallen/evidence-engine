@@ -218,6 +218,23 @@ data "aws_kms_public_key" "signing" {
   key_id = aws_kms_key.signing.arn
 }
 
+resource "aws_kms_key" "acceptance_encryption" {
+  description              = "EvidenceEngine DynamoDB acceptance table encryption key"
+  key_usage                = "ENCRYPT_DECRYPT"
+  customer_master_key_spec = "SYMMETRIC_DEFAULT"
+  enable_key_rotation      = true
+  deletion_window_in_days  = 30
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_kms_alias" "acceptance_encryption" {
+  name          = "alias/${var.project_name}-acceptance-encryption"
+  target_key_id = aws_kms_key.acceptance_encryption.key_id
+}
+
 resource "aws_dynamodb_table" "acceptance" {
   name                        = "${var.project_name}-acceptance"
   billing_mode                = "PAY_PER_REQUEST"
@@ -240,7 +257,8 @@ resource "aws_dynamodb_table" "acceptance" {
   }
 
   server_side_encryption {
-    enabled = true
+    enabled     = true
+    kms_key_arn = aws_kms_key.acceptance_encryption.arn
   }
 
   lifecycle {
@@ -413,6 +431,55 @@ data "aws_iam_policy_document" "consumer_permissions" {
     effect    = "Allow"
     actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.acceptance.arn]
+  }
+
+  # Permit the consumer role to use this key only through DynamoDB and only
+  # for the acceptance table. Key use remains separate from S3 encryption
+  # and the asymmetric evidence-signing key.
+  statement {
+    sid    = "UseAcceptanceKeyThroughDynamoDB"
+    effect = "Allow"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+    ]
+    resources = [aws_kms_key.acceptance_encryption.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.*.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:tableName"
+      values   = [aws_dynamodb_table.acceptance.name]
+    }
+  }
+
+  # DynamoDB may create grants for its managed use of the key. Restrict
+  # grant creation to AWS-resource requests routed through DynamoDB.
+  statement {
+    sid       = "CreateAcceptanceKeyGrantForDynamoDB"
+    effect    = "Allow"
+    actions   = ["kms:CreateGrant"]
+    resources = [aws_kms_key.acceptance_encryption.arn]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.*.amazonaws.com"]
+    }
   }
 }
 # New evidence object versions receive 30 days of Governance Mode retention.
