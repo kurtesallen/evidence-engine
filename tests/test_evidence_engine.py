@@ -1,5 +1,7 @@
+
 import json
 import subprocess
+
 import pytest
 
 from evidence_engine.canonical import (
@@ -49,7 +51,10 @@ def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
         ],
     }
 
-    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    registry_path.write_text(
+        json.dumps(registry),
+        encoding="utf-8",
+    )
 
     return verify_bundle(
         artifacts,
@@ -83,6 +88,7 @@ def test_noncanonical_manifest_bytes_are_rejected(tmp_path):
 
 def test_valid_bundle_passes(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
+
     assert check_bundle(artifacts, output, public_key)
 
 
@@ -90,7 +96,9 @@ def test_tampered_artifact_fails(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
 
     artifact_path = artifacts / "plan.json"
-    artifact_path.write_bytes(artifact_path.read_bytes() + b"TAMPERED")
+    artifact_path.write_bytes(
+        artifact_path.read_bytes() + b"TAMPERED"
+    )
 
     assert not check_bundle(artifacts, output, public_key)
 
@@ -98,7 +106,10 @@ def test_tampered_artifact_fails(tmp_path):
 def test_extra_artifact_fails(tmp_path):
     artifacts, output, _, public_key = create_bundle(tmp_path)
 
-    (artifacts / "unexpected.txt").write_text("extra", encoding="utf-8")
+    (artifacts / "unexpected.txt").write_text(
+        "extra",
+        encoding="utf-8",
+    )
 
     assert not check_bundle(artifacts, output, public_key)
 
@@ -138,7 +149,10 @@ def test_manifest_rejects_missing_required_artifact(tmp_path):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
 
-    (artifacts / "plan.json").write_text("{}", encoding="utf-8")
+    (artifacts / "plan.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="Artifact set mismatch"):
         build_manifest(
@@ -151,14 +165,22 @@ def test_manifest_rejects_missing_required_artifact(tmp_path):
 def test_manifest_rejects_unknown_field(tmp_path):
     artifacts, output, _, _ = create_bundle(tmp_path)
 
-    manifest = json.loads((output / "manifest.json").read_bytes())
+    manifest = json.loads(
+        (output / "manifest.json").read_bytes()
+    )
     manifest["unrecognized_field"] = True
 
-    with pytest.raises(ValueError, match="missing or unknown top-level fields"):
+    with pytest.raises(
+        ValueError,
+        match="missing or unknown top-level fields",
+    ):
         validate_manifest(manifest)
 
 
-def test_ci_sealing_rejects_checkout_commit_mismatch(tmp_path, monkeypatch):
+def test_ci_sealing_rejects_checkout_commit_mismatch(
+    tmp_path,
+    monkeypatch,
+):
     artifacts = tmp_path / "artifacts"
     output = tmp_path / "sealed"
     private_key = tmp_path / "private.pem"
@@ -167,14 +189,30 @@ def test_ci_sealing_rejects_checkout_commit_mismatch(tmp_path, monkeypatch):
     artifacts.mkdir()
     generate_key_pair(private_key, public_key)
 
-    for name in ("plan.json", "state.json", "commit.txt", "version.txt"):
-        (artifacts / name).write_text("{}\n", encoding="utf-8")
+    for name in (
+        "plan.json",
+        "state.json",
+        "commit.txt",
+        "version.txt",
+    ):
+        (artifacts / name).write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
 
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    monkeypatch.setenv("GITHUB_REPOSITORY", "example-org/evidence-engine")
+    monkeypatch.setenv(
+        "GITHUB_REPOSITORY",
+        "example-org/evidence-engine",
+    )
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     monkeypatch.setenv("GITHUB_RUN_ID", "123456789")
+    monkeypatch.setenv("GITHUB_RUN_NUMBER", "42")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    monkeypatch.setenv(
+        "EVIDENCE_ENGINE_STREAM_ID", "terraform-production"
+    )
     monkeypatch.setenv(
         "GITHUB_WORKFLOW_REF",
         "example-org/evidence-engine/.github/workflows/ci.yml@refs/heads/main",
@@ -190,5 +228,8 @@ def test_ci_sealing_rejects_checkout_commit_mismatch(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(ValueError, match="does not match checked-out Git commit"):
+    with pytest.raises(
+        ValueError,
+        match="does not match checked-out Git commit",
+    ):
         seal(artifacts, output, private_key)

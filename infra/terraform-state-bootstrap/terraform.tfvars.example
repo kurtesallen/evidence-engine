@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and set these values before local validation.
+# Never commit terraform.tfvars or Terraform state files.
+aws_region         = "us-east-1"
+expected_account_id = "REPLACE_WITH_12_DIGIT_AWS_ACCOUNT_ID"
+bucket_name        = "replace-with-globally-unique-state-bucket-name"
+project_name        = "evidence-engine"
+
+# tags = {
+#   CostCenter = "security-engineering"
+# }

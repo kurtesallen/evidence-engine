@@ -1,3 +1,4 @@
+
 """
 Seal and verify hardened EvidenceEngine bundles.
 """
@@ -23,7 +24,7 @@ from evidence_engine.kms_signing import (
 )
 from evidence_engine.manifest import sha256_file, write_manifest
 from evidence_engine.schema import validate_manifest
-from evidence_engine.signing import KEY_ID, sign_bytes, verify_bytes
+from evidence_engine.signing import KEY_ID, sign_bytes
 from evidence_engine.trust import resolve_trusted_key
 
 
@@ -45,23 +46,37 @@ def seal(
 
     Local mode uses an RSA private-key file.
     KMS mode uses an AWS KMS asymmetric signing key.
+
+    Local manifests use schema v1.1.
+    GitHub Actions manifests use schema v1.2 and include
+    CI ordering and workflow provenance claims.
     """
     repository = Path.cwd().resolve()
 
     if not artifacts.is_dir():
-        raise ValueError(f"Artifacts directory does not exist: {artifacts}")
+        raise ValueError(
+            f"Artifacts directory does not exist: {artifacts}"
+        )
 
     if signing_mode not in {"local", "kms"}:
         raise ValueError("Signing mode must be 'local' or 'kms'")
 
     if signing_mode == "local":
         if private_key is None:
-            raise ValueError("A private-key path is required for local signing")
+            raise ValueError(
+                "A private-key path is required for local signing"
+            )
         key_id = KEY_ID
     else:
         if not isinstance(kms_key_id, str) or not kms_key_id.strip():
-            raise ValueError("A KMS key ID or ARN is required for KMS signing")
+            raise ValueError(
+                "A KMS key ID or ARN is required for KMS signing"
+            )
         key_id = kms_key_id
+
+    # Local sealing remains on schema v1.1.
+    # CI sealing uses schema v1.3 with ordered provenance and stream ID.
+    schema_version = "1.1"
 
     # ----------------------------------------------------------------------
     # CI provenance validation
@@ -71,19 +86,33 @@ def seal(
 
         try:
             result = subprocess.run(
-                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "rev-parse",
+                    "HEAD",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise ValueError("Cannot verify checked-out Git commit in CI") from exc
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            raise ValueError(
+                "Cannot verify checked-out Git commit in CI"
+            ) from exc
 
         checked_out_sha = result.stdout.strip().lower()
 
         if checked_out_sha != context["commit_sha"]:
-            raise ValueError("CI commit SHA does not match checked-out Git commit")
+            raise ValueError(
+                "CI commit SHA does not match checked-out Git commit"
+            )
 
         provenance = provenance_for(repository)
         provenance["repository"] = context["repository"]
@@ -91,18 +120,32 @@ def seal(
         provenance["workflow_run_id"] = context["run_id"]
         provenance["source"] = "github-actions-claimed"
 
+        # Schema v1.3 ordered CI fields and stream identity.
+        provenance["ref"] = context["ref"]
+        provenance["workflow_ref"] = context["workflow_ref"]
+        provenance["run_number"] = context["run_number"]
+        provenance["run_attempt"] = context["run_attempt"]
+        provenance["stream_id"] = context["stream_id"]
+
+        schema_version = "1.3"
     else:
         provenance = provenance_for(repository)
 
     # ----------------------------------------------------------------------
-    # Output directory + manifest creation
+    # Output directory and manifest creation
     # ----------------------------------------------------------------------
     output.mkdir(parents=True, exist_ok=True)
 
     manifest_path = output / "manifest.json"
     signature_path = output / "manifest.sig"
 
-    write_manifest(artifacts, manifest_path, provenance, key_id)
+    write_manifest(
+        artifacts,
+        manifest_path,
+        provenance,
+        key_id,
+        schema_version=schema_version,
+    )
 
     manifest_bytes = manifest_path.read_bytes()
 
@@ -117,7 +160,10 @@ def seal(
 
     signature_path.write_bytes(signature)
 
-    print(f"Sealed {artifacts} with key ID {key_id} using {signing_mode} signing")
+    print(
+        f"Sealed {artifacts} with key ID {key_id} "
+        f"using {signing_mode} signing (schema v{schema_version})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +194,7 @@ def verify_bundle(
             print("FAIL: unexpected signing key ID")
             return False
 
-        # Resolve trusted key
+        # Resolve the trusted public key authorized for this source.
         trusted_key_path = resolve_trusted_key(
             trust_registry,
             expected_key_id,
@@ -157,18 +203,27 @@ def verify_bundle(
 
         public_key_pem = trusted_key_path.read_bytes()
 
-        # Load PEM or DER
+        # Load PEM or DER public key material.
         try:
-            public_key = serialization.load_pem_public_key(public_key_pem)
+            public_key = serialization.load_pem_public_key(
+                public_key_pem
+            )
         except ValueError:
-            public_key = serialization.load_der_public_key(public_key_pem)
+            public_key = serialization.load_der_public_key(
+                public_key_pem
+            )
 
         public_key_der = public_key.public_bytes(
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
 
-        if not kms_verify_bytes(public_key_der, manifest_bytes, signature):
+        # Verify the signature over the exact canonical manifest bytes.
+        if not kms_verify_bytes(
+            public_key_der,
+            manifest_bytes,
+            signature,
+        ):
             print("FAIL: manifest signature is invalid")
             return False
 
@@ -180,14 +235,17 @@ def verify_bundle(
         expected_names = {entry["name"] for entry in entries}
         actual_names = set()
 
-        # Reject symlinks, directories, unexpected entries
+        # Reject symlinks, directories, and unexpected entries.
         for path in artifacts.iterdir():
             if path.is_symlink():
                 print(f"FAIL: symbolic link found: {path.name}")
                 return False
 
             if not path.is_file():
-                print(f"FAIL: unexpected directory or special entry: {path.name}")
+                print(
+                    "FAIL: unexpected directory or special entry: "
+                    f"{path.name}"
+                )
                 return False
 
             actual_names.add(path.name)
@@ -196,7 +254,7 @@ def verify_bundle(
             print("FAIL: artifact set differs from manifest")
             return False
 
-        # Validate size + digest
+        # Validate artifact sizes and SHA-256 digests.
         for entry in entries:
             path = artifacts / entry["name"]
 
@@ -208,10 +266,14 @@ def verify_bundle(
                 print(f"FAIL: digest mismatch: {entry['name']}")
                 return False
 
-        print("PASS: manifest is canonical and schema-valid")
+        print(
+            "PASS: manifest is canonical and schema-valid "
+            f"(v{manifest['schema_version']})"
+        )
         print(f"PASS: trusted key authorized: {expected_key_id}")
         print("PASS: manifest signature verified")
         print(f"PASS: verified {len(entries)} required artifacts")
+
         return True
 
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -228,37 +290,80 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Seal and verify EvidenceEngine bundles."
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
 
     # ----------------------------------------------------------------------
     # Seal command
     # ----------------------------------------------------------------------
-    seal_parser = subparsers.add_parser("seal", help="Create a signed evidence manifest.")
-    seal_parser.add_argument("--artifacts", type=Path, required=True)
-    seal_parser.add_argument("--output", type=Path, required=True)
+    seal_parser = subparsers.add_parser(
+        "seal",
+        help="Create a signed evidence manifest.",
+    )
+    seal_parser.add_argument(
+        "--artifacts",
+        type=Path,
+        required=True,
+    )
+    seal_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+    )
     seal_parser.add_argument(
         "--signing-mode",
         choices=["local", "kms"],
         default="local",
         help="Choose local RSA signing or AWS KMS signing.",
     )
-    seal_parser.add_argument("--private-key", type=Path, help="Private-key path for local signing.")
-    seal_parser.add_argument("--kms-key-id", help="AWS KMS asymmetric key ID or ARN.")
-    seal_parser.add_argument("--aws-region", default="us-east-1", help="AWS region containing the KMS key.")
+    seal_parser.add_argument(
+        "--private-key",
+        type=Path,
+        help="Private-key path for local signing.",
+    )
+    seal_parser.add_argument(
+        "--kms-key-id",
+        help="AWS KMS asymmetric key ID or ARN.",
+    )
+    seal_parser.add_argument(
+        "--aws-region",
+        default="us-east-1",
+        help="AWS region containing the KMS key.",
+    )
 
     # ----------------------------------------------------------------------
     # Verify command
     # ----------------------------------------------------------------------
-    verify_parser = subparsers.add_parser("verify", help="Verify a signed evidence bundle.")
-    verify_parser.add_argument("--artifacts", type=Path, required=True)
-    verify_parser.add_argument("--manifest", type=Path, required=True)
-    verify_parser.add_argument("--signature", type=Path, required=True)
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Verify a signed evidence bundle.",
+    )
+    verify_parser.add_argument(
+        "--artifacts",
+        type=Path,
+        required=True,
+    )
+    verify_parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+    )
+    verify_parser.add_argument(
+        "--signature",
+        type=Path,
+        required=True,
+    )
     verify_parser.add_argument(
         "--trust-registry",
         type=Path,
         default=Path("config/trust_registry.json"),
     )
-    verify_parser.add_argument("--expected-key-id", required=True)
+    verify_parser.add_argument(
+        "--expected-key-id",
+        required=True,
+    )
 
     args = parser.parse_args()
 

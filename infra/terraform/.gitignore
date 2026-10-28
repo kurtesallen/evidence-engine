@@ -1,0 +1,10 @@
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+crash.*.log
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform plans may contain sensitive values
+*.tfplan

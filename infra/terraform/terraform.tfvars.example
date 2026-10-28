@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and replace both GitHub values and the bucket name.
+# Never commit terraform.tfvars or Terraform state files.
+aws_region        = "us-east-1"
+project_name      = "evidence-engine"
+bucket_name       = "replace-with-a-globally-unique-bucket-name"
+evidence_prefix   = "evidence-engine"
+github_owner      = "YOUR_GITHUB_OWNER"
+github_repository = "evidence-engine"
+
+# Create these environments in GitHub repository Settings > Environments.
+# Restrict deployment branches to the protected master branch and require
+# reviewers before allowing either environment to run.
+producer_environment_name = "evidence-producer"
+consumer_environment_name = "evidence-consumer"
+
+# tags = {
+#   CostCenter = "security-engineering"
+# }
