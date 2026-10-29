@@ -204,5 +204,5 @@ jobs:
               ;;
           esac
 
-      - name: Verify remote bundle and assert replay rejection
+      - name: Verify tampering, reject unauthorized source, accept, and reject replay
         run: python scripts/e2e_synthetic_aws.py consume

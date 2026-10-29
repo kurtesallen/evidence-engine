@@ -5,6 +5,15 @@ import json
 import os
 import subprocess
 import sys
+import shutil
+from contextlib import redirect_stdout
+from io import StringIO
+
+from evidence_engine.aws.reference import BundleReference
+from evidence_engine.aws.storage_config import create_s3_bundle_storage
+from evidence_engine.trust import resolve_trusted_key
+from evidence_engine.verify import verify_bundle
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -201,6 +210,115 @@ def produce() -> None:
     print("Sanitization canaries were redacted before manifest hashing and upload.")
     print(f"Transfer reference created: {REFERENCE_FILE.name}")
 
+def assert_negative_paths(
+    payload: dict[str, Any],
+    consumer: Any,
+    expected_key_id: str,
+) -> None:
+    """Exercise rejection paths without modifying remote S3 objects."""
+    raw_reference = payload.get("bundle_reference")
+    raw_receipt = payload.get("receipt")
+
+    if not isinstance(raw_reference, dict):
+        raise RuntimeError("Bundle reference is missing or invalid")
+    if not isinstance(raw_receipt, dict):
+        raise RuntimeError("Producer receipt is missing or invalid")
+
+    reference = BundleReference.from_dict(raw_reference)
+
+    # 1. An altered receipt source must fail before acceptance is recorded.
+    forged_payload = dict(payload)
+    forged_receipt = dict(raw_receipt)
+    forged_receipt["source"] = "local-claimed"
+    forged_payload["receipt"] = forged_receipt
+
+    result = consumer.run(forged_payload)
+    if result.success or result.error != "source-mismatch":
+        raise RuntimeError(
+            "Forged receipt-source check failed: expected source-mismatch, "
+            f"got success={result.success}, error={result.error}"
+        )
+    print("PASS: forged receipt source rejected.")
+
+    # 2. The configured trust registry must reject this key for a source
+    #    that is not authorized by policy.
+    try:
+        resolve_trusted_key(
+            TRUST_REGISTRY,
+            expected_key_id,
+            "local-claimed",
+        )
+    except ValueError as exc:
+        if "not authorized for this source" not in str(exc):
+            raise RuntimeError(
+                f"Unexpected trust-registry rejection: {exc}"
+            ) from exc
+    else:
+        raise RuntimeError(
+            "Trust-registry negative test failed: unauthorized source accepted"
+        )
+    print("PASS: trust registry rejects unauthorized source.")
+
+    # 3. Download exact version IDs to a temporary directory. Tamper only
+    #    with the temporary copy, never with the retained S3 objects.
+    storage = create_s3_bundle_storage(environ=os.environ)
+
+    with TemporaryDirectory(
+        prefix="evidence-engine-negative-paths-"
+    ) as temporary:
+        root = Path(temporary)
+        baseline = root / "baseline"
+
+        storage.download_bundle(
+            prefix=reference.prefix,
+            destination=baseline,
+            reference=reference,
+        )
+
+        verified = verify_bundle(
+            baseline / "artifacts",
+            baseline / "manifest.json",
+            baseline / "manifest.sig",
+            TRUST_REGISTRY,
+            expected_key_id,
+        )
+        if not verified:
+            raise RuntimeError(
+                "Negative-test control failed: original bundle did not verify"
+            )
+        print("PASS: original downloaded bundle verifies.")
+
+        tampered = root / "tampered"
+        shutil.copytree(baseline, tampered)
+
+        plan_path = tampered / "artifacts" / "plan.json"
+        original = plan_path.read_bytes()
+        if not original:
+            raise RuntimeError("Synthetic plan.json is unexpectedly empty")
+
+        # Flip one byte without changing file size.
+        plan_path.write_bytes(
+            bytes([original[0] ^ 1]) + original[1:]
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            verified = verify_bundle(
+                tampered / "artifacts",
+                tampered / "manifest.json",
+                tampered / "manifest.sig",
+                TRUST_REGISTRY,
+                expected_key_id,
+            )
+
+        diagnostic = output.getvalue()
+        if verified or "FAIL: digest mismatch: plan.json" not in diagnostic:
+            raise RuntimeError(
+                "Tampering check failed: expected plan.json digest mismatch; "
+                f"verification output was {diagnostic!r}"
+            )
+
+        print("PASS: tampered plan.json rejected by digest verification.")
 
 def consume() -> None:
     require_env("AWS_REGION")
@@ -224,6 +342,7 @@ def consume() -> None:
         expected_stream_id=require_env("EVIDENCE_ENGINE_EXPECTED_STREAM_ID"),
     )
 
+    assert_negative_paths(payload, consumer, signing_key_id)
     first = consumer.run(payload)
     if not first.success:
         raise RuntimeError(
