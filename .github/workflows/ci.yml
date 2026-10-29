@@ -1,3 +1,4 @@
+
 name: EvidenceEngine CI
 
 on:
@@ -8,11 +9,9 @@ on:
 permissions:
   contents: read
 
-
 concurrency:
   group: evidence-engine-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 
 jobs:
   test:
@@ -68,6 +67,9 @@ jobs:
           GITHUB_REF: ${{ github.ref }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVIDENCE_ENGINE_STREAM_ID: ci-validation
         run: |
           python - <<'PY'
           import json

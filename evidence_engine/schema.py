@@ -1,4 +1,5 @@
-"""Strict validation rules for EvidenceEngine manifest v1.1."""
+
+"""Strict validation rules for EvidenceEngine manifest v1.1, v1.2, and v1.3."""
 
 import re
 from typing import Any
@@ -11,6 +12,10 @@ REQUIRED_ARTIFACTS = {
 }
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+POSITIVE_INTEGER_RE = re.compile(r"^[1-9][0-9]*$")
+STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+SUPPORTED_SCHEMA_VERSIONS = {"1.1", "1.2", "1.3"}
 
 TOP_LEVEL_FIELDS = {
     "schema_version",
@@ -29,7 +34,7 @@ ARTIFACT_FIELDS = {
     "sha256",
 }
 
-PROVENANCE_FIELDS = {
+PROVENANCE_FIELDS_V1_1 = {
     "repository",
     "commit_sha",
     "workflow_run_id",
@@ -37,6 +42,18 @@ PROVENANCE_FIELDS = {
     "provider_lock_sha256",
     "source",
 }
+
+ORDERED_CI_FIELDS = {
+    "ref",
+    "workflow_ref",
+    "run_number",
+    "run_attempt",
+}
+
+PROVENANCE_FIELDS_V1_2 = (
+    PROVENANCE_FIELDS_V1_1 | ORDERED_CI_FIELDS
+)
+PROVENANCE_FIELDS_V1_3 = PROVENANCE_FIELDS_V1_2 | {"stream_id"}
 
 
 def validate_manifest(value: Any) -> None:
@@ -50,7 +67,12 @@ def validate_manifest(value: Any) -> None:
             "Manifest has missing or unknown top-level fields"
         )
 
-    if value["schema_version"] != "1.1":
+    schema_version = value["schema_version"]
+
+    if (
+        not isinstance(schema_version, str)
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ValueError("Unsupported manifest schema")
 
     if value["hash_algorithm"] != "SHA-256":
@@ -68,19 +90,26 @@ def validate_manifest(value: Any) -> None:
     ):
         raise ValueError("Invalid key ID")
 
-    # Validate provenance structure.
+    # Select the exact provenance schema for this manifest version.
     provenance = value["provenance"]
 
     if not isinstance(provenance, dict):
         raise ValueError("Provenance must be an object")
 
-    if set(provenance) != PROVENANCE_FIELDS:
+    if schema_version == "1.1":
+        expected_provenance_fields = PROVENANCE_FIELDS_V1_1
+    elif schema_version == "1.2":
+        expected_provenance_fields = PROVENANCE_FIELDS_V1_2
+    else:
+        expected_provenance_fields = PROVENANCE_FIELDS_V1_3
+
+    if set(provenance) != expected_provenance_fields:
         raise ValueError(
             "Provenance has missing or unknown fields"
         )
 
     # Validate every provenance field individually.
-    for field in PROVENANCE_FIELDS:
+    for field in expected_provenance_fields:
         field_value = provenance[field]
 
         if not isinstance(field_value, str):
@@ -109,6 +138,34 @@ def validate_manifest(value: Any) -> None:
 
     if lock_digest and not SHA256_RE.fullmatch(lock_digest):
         raise ValueError("Invalid provider lock-file digest")
+
+    # v1.2 adds ordered CI provenance; v1.3 also binds a stream ID.
+    # These fields are claims; their presence does not independently
+    # authenticate the workflow or runner.
+    if schema_version in {"1.2", "1.3"}:
+        if provenance["source"] != "github-actions-claimed":
+            raise ValueError(
+                "Manifest v1.2 requires GitHub Actions provenance"
+            )
+
+        if not provenance["ref"].startswith("refs/"):
+            raise ValueError("Invalid provenance ref")
+
+        if not provenance["workflow_ref"]:
+            raise ValueError("Invalid workflow reference")
+
+        for field in ("run_number", "run_attempt"):
+            if not POSITIVE_INTEGER_RE.fullmatch(
+                provenance[field]
+            ):
+                raise ValueError(
+                    f"Invalid provenance field: {field}"
+                )
+
+    if schema_version == "1.3":
+        stream_id = provenance["stream_id"]
+        if not STREAM_ID_RE.fullmatch(stream_id):
+            raise ValueError("Invalid provenance stream_id")
 
     # Validate artifacts.
     artifacts = value["artifacts"]

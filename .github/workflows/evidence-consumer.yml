@@ -14,11 +14,29 @@ jobs:
     environment:
       name: evidence-consumer
 
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EVIDENCE_ENGINE_CONSUMER_ID: ${{ vars.EVIDENCE_ENGINE_CONSUMER_ID }}
+      EVIDENCE_ENGINE_EXPECTED_STREAM_ID: ${{ vars.EVIDENCE_ENGINE_EXPECTED_STREAM_ID }}
+
     permissions:
       contents: read
       id-token: write
 
     steps:
+      - name: Validate EvidenceEngine consumer configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${AWS_ROLE_ARN}"
+          test -n "${AWS_REGION}"
+          test -n "${EVIDENCE_ENGINE_CONSUMER_ID}"
+          test -n "${EVIDENCE_ENGINE_EXPECTED_STREAM_ID}"
+
+          echo "EvidenceEngine consumer configuration is present."
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:

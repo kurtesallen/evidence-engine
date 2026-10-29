@@ -1,0 +1,13 @@
+# Copy this to backend.tf only after this bootstrap has been applied
+# with explicit approval and the outputs have been reviewed.
+# Replace both placeholders with the exact Terraform outputs.
+terraform {
+  backend "s3" {
+    bucket       = "REPLACE_WITH_state_bucket_name"
+    key          = "bootstrap/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    kms_key_id   = "REPLACE_WITH_state_kms_key_arn"
+    use_lockfile = true
+  }
+}

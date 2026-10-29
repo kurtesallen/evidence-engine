@@ -14,11 +14,27 @@ jobs:
     environment:
       name: evidence-producer
 
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EVIDENCE_ENGINE_STREAM_ID: ${{ vars.EVIDENCE_ENGINE_STREAM_ID }}
+
     permissions:
       contents: read
       id-token: write
 
     steps:
+      - name: Validate EvidenceEngine producer configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${AWS_ROLE_ARN}"
+          test -n "${AWS_REGION}"
+          test -n "${EVIDENCE_ENGINE_STREAM_ID}"
+
+          echo "EvidenceEngine producer configuration is present."
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
