@@ -1,0 +1,208 @@
+name: EvidenceEngine Synthetic AWS End-to-End Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_synthetic_only:
+        description: "Confirm this workflow uses synthetic evidence only (no real Terraform state)."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evidence-engine-synthetic-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Validate manual test request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require master and explicit synthetic-only confirmation
+        shell: bash
+        env:
+          CONFIRM_SYNTHETIC_ONLY: ${{ inputs.confirm_synthetic_only }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::This integration workflow may only run from master."
+            exit 1
+          fi
+          if [[ "$CONFIRM_SYNTHETIC_ONLY" != "true" ]]; then
+            echo "::error::Confirm synthetic-only execution before running."
+            exit 1
+          fi
+          echo "Manual synthetic-only test confirmed on master."
+
+  produce:
+    name: Produce and publish synthetic evidence
+    needs: guard
+    runs-on: ubuntu-latest
+    environment:
+      name: evidence-producer
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      EVIDENCE_ENGINE_STREAM_ID: evidence-integration-test
+      EVIDENCE_ENGINE_S3_BUCKET: evidence-engine
+      EVIDENCE_ENGINE_S3_KMS_KEY_ID: arn:aws:kms:us-east-1:846470648858:key/ef193392-4dee-47a5-84d2-8d109f7285f2
+      EVIDENCE_ENGINE_SIGNING_KEY_ID: arn:aws:kms:us-east-1:846470648858:key/f384e1ad-e6c4-4332-a55a-5dccef834716
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install AWS-enabled project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[aws]"
+
+      - name: Validate producer configuration and trust registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ROLE_ARN"
+          test -n "$AWS_REGION"
+          test -n "$EVIDENCE_ENGINE_S3_BUCKET"
+          test -n "$EVIDENCE_ENGINE_S3_KMS_KEY_ID"
+          test -n "$EVIDENCE_ENGINE_SIGNING_KEY_ID"
+          test -f trust/registry.json
+          test -f trust/keys/evidence-engine-signing-public.pem
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: "846470648858"
+          role-session-name: EvidenceEngineE2EProducer-${{ github.run_id }}
+
+      - name: Verify producer AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity_arn="$(aws sts get-caller-identity --query Arn --output text)"
+          case "$identity_arn" in
+            arn:aws:sts::846470648858:assumed-role/evidence-engine-producer/*)
+              echo "Producer role assumption verified."
+              ;;
+            *)
+              echo "::error::Unexpected producer identity: $identity_arn"
+              exit 1
+              ;;
+          esac
+
+      - name: Create, sanitize, sign, and upload synthetic bundle
+        env:
+          GITHUB_ACTIONS: "true"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: python scripts/e2e_synthetic_aws.py produce
+
+      - name: Transfer versioned bundle reference to consumer job
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: evidence-engine-e2e-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bundle-reference.json
+          if-no-files-found: error
+          retention-days: 1
+
+  consume:
+    name: Verify, accept, and reject replay
+    needs: produce
+    runs-on: ubuntu-latest
+    environment:
+      name: evidence-consumer
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      EVIDENCE_ENGINE_S3_BUCKET: evidence-engine
+      EVIDENCE_ENGINE_S3_KMS_KEY_ID: arn:aws:kms:us-east-1:846470648858:key/ef193392-4dee-47a5-84d2-8d109f7285f2
+      EVIDENCE_ENGINE_SIGNING_KEY_ID: arn:aws:kms:us-east-1:846470648858:key/f384e1ad-e6c4-4332-a55a-5dccef834716
+      EVIDENCE_ENGINE_ACCEPTANCE_BACKEND: dynamodb
+      EVIDENCE_ENGINE_DYNAMODB_TABLE: evidence-engine-acceptance
+      EVIDENCE_ENGINE_CONSUMER_ID: evidence-integration-test-consumer
+      EVIDENCE_ENGINE_EXPECTED_STREAM_ID: evidence-integration-test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install AWS-enabled project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[aws]"
+
+      - name: Validate consumer configuration and trust registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ROLE_ARN"
+          test -n "$AWS_REGION"
+          test -n "$EVIDENCE_ENGINE_DYNAMODB_TABLE"
+          test -n "$EVIDENCE_ENGINE_CONSUMER_ID"
+          test -n "$EVIDENCE_ENGINE_EXPECTED_STREAM_ID"
+          test -f trust/registry.json
+          test -f trust/keys/evidence-engine-signing-public.pem
+
+      - name: Download producer bundle reference
+        uses: actions/download-artifact@v7.0.2
+        with:
+          name: evidence-engine-e2e-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: "846470648858"
+          role-session-name: EvidenceEngineE2EConsumer-${{ github.run_id }}
+
+      - name: Verify consumer AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity_arn="$(aws sts get-caller-identity --query Arn --output text)"
+          case "$identity_arn" in
+            arn:aws:sts::846470648858:assumed-role/evidence-engine-consumer/*)
+              echo "Consumer role assumption verified."
+              ;;
+            *)
+              echo "::error::Unexpected consumer identity: $identity_arn"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify remote bundle and assert replay rejection
+        run: python scripts/e2e_synthetic_aws.py consume

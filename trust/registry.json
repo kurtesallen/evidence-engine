@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "keys": [
+    {
+      "key_id": "arn:aws:kms:us-east-1:846470648858:key/f384e1ad-e6c4-4332-a55a-5dccef834716",
+      "public_key": "keys/evidence-engine-signing-public.pem",
+      "status": "active",
+      "allowed_sources": ["github-actions-claimed"]
+    }
+  ]
+}
