@@ -176,7 +176,7 @@ jobs:
           test -f trust/keys/evidence-engine-signing-public.pem
 
       - name: Download producer bundle reference
-        uses: actions/download-artifact@v7.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           name: evidence-engine-e2e-reference-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
