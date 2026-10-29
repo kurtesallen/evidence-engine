@@ -32,6 +32,10 @@ def create_bundle(tmp_path):
 
     return artifacts, output, private_key, public_key
 
+@pytest.fixture(autouse=True)
+def isolate_local_sealing_from_github_runner(monkeypatch):
+    """Keep ordinary bundle tests in local-sealing mode."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
 
 def check_bundle(artifacts, output, public_key, key_id=KEY_ID):
     registry_path = output / "trust_registry.json"
