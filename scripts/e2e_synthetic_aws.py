@@ -288,6 +288,97 @@ def assert_negative_paths(
             )
         print("PASS: original downloaded bundle verifies.")
 
+
+        # Test full verification against a temporary restrictive trust
+        # registry. Preserve the valid manifest, signature, and artifacts.
+        registry_data = json.loads(
+            TRUST_REGISTRY.read_text(encoding="utf-8")
+        )
+        entries = registry_data.get("keys")
+
+        if not isinstance(entries, list):
+            raise RuntimeError("Trust registry keys are invalid")
+
+        matches = [
+            item
+            for item in entries
+            if isinstance(item, dict)
+            and item.get("key_id") == expected_key_id
+        ]
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one matching trust registry entry"
+            )
+
+        entry = matches[0]
+        allowed_sources = entry.get("allowed_sources")
+
+        if (
+            not isinstance(allowed_sources, list)
+            or "github-actions-claimed" not in allowed_sources
+        ):
+            raise RuntimeError(
+                "Original registry does not authorize the CI source"
+            )
+
+        # Resolve the legitimate public key first.
+        original_key = resolve_trusted_key(
+            TRUST_REGISTRY,
+            expected_key_id,
+            "github-actions-claimed",
+        )
+
+        relative_key = Path(entry["public_key"])
+
+        if relative_key.is_absolute() or ".." in relative_key.parts:
+            raise RuntimeError("Public key path is not safely relative")
+
+        # Construct a temporary project with the same relative key layout.
+        test_registry_dir = root / "unauthorized-policy" / "trust"
+        test_registry_dir.mkdir(parents=True, exist_ok=True)
+
+        test_key = test_registry_dir / relative_key
+        test_key.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(original_key, test_key)
+
+        # Preserve a structurally valid registry but remove CI authorization.
+        entry["allowed_sources"] = ["local-claimed"]
+
+        test_registry = test_registry_dir / "registry.json"
+        test_registry.write_text(
+            json.dumps(registry_data, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            verified = verify_bundle(
+                baseline / "artifacts",
+                baseline / "manifest.json",
+                baseline / "manifest.sig",
+                test_registry,
+                expected_key_id,
+            )
+
+        diagnostic = output.getvalue()
+        expected_message = (
+            "Signing key is not authorized for this source"
+        )
+
+        if verified or expected_message not in diagnostic:
+            raise RuntimeError(
+                "Full-verifier trust-policy test failed: "
+                f"expected {expected_message!r}; "
+                f"got {diagnostic!r}"
+            )
+
+        print(
+            "PASS: full verifier rejects a signing key/source "
+            "combination not authorized by its trust registry."
+        )
+
+
         tampered = root / "tampered"
         shutil.copytree(baseline, tampered)
 
