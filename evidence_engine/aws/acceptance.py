@@ -3,13 +3,22 @@
 
 from __future__ import annotations
 
+import random
 import re
+import time
+import uuid
 from typing import Any, Literal
 
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
 AcceptanceOutcome = Literal["accepted", "replay", "stale"]
+
+_MAX_TRANSACTION_ATTEMPTS = 6
+_TRANSACTION_BACKOFF_BASE_SECONDS = 0.025
+_TRANSACTION_BACKOFF_MAX_SECONDS = 0.5
+_TRANSACTION_IN_PROGRESS_RECOVERY_SECONDS = 5.0
 
 
 class DynamoDBAcceptanceState:
@@ -58,11 +67,13 @@ class DynamoDBAcceptanceState:
             # Only the specific conditional-write conflict means "already seen".
             response = getattr(exc, "response", None)
             error = response.get("Error", {}) if isinstance(response, dict) else {}
+
             if (
                 isinstance(error, dict)
                 and error.get("Code") == "ConditionalCheckFailedException"
             ):
                 return False
+
             raise
 
         return True
@@ -77,14 +88,25 @@ class DynamoDBAcceptanceState:
         run_attempt: int,
     ) -> AcceptanceOutcome:
         """Atomically record a digest and advance its stream checkpoint."""
-        if not isinstance(bundle_digest, str) or not _DIGEST_RE.fullmatch(bundle_digest):
+        if not isinstance(bundle_digest, str) or not _DIGEST_RE.fullmatch(
+            bundle_digest
+        ):
             raise ValueError("Invalid bundle digest")
-        if not isinstance(consumer_id, str) or not _IDENTIFIER_RE.fullmatch(consumer_id):
+
+        if not isinstance(consumer_id, str) or not _IDENTIFIER_RE.fullmatch(
+            consumer_id
+        ):
             raise ValueError("Invalid consumer ID")
-        if not isinstance(stream_id, str) or not _IDENTIFIER_RE.fullmatch(stream_id):
+
+        if not isinstance(stream_id, str) or not _IDENTIFIER_RE.fullmatch(
+            stream_id
+        ):
             raise ValueError("Invalid stream ID")
 
-        for name, value in (("run_number", run_number), ("run_attempt", run_attempt)):
+        for name, value in (
+            ("run_number", run_number),
+            ("run_attempt", run_attempt),
+        ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"Invalid {name}")
 
@@ -99,6 +121,7 @@ class DynamoDBAcceptanceState:
             "bundle_digest": {"S": bundle_digest},
             "stream_id": {"S": stream_id},
         }
+
         checkpoint_item = {
             "pk": {"S": f"CONSUMER#{consumer_id}"},
             "sk": {"S": f"CHECKPOINT#{stream_id}"},
@@ -138,29 +161,73 @@ class DynamoDBAcceptanceState:
                         },
                     }
                 },
-            ]
+            ],
+            # Generate once and preserve across retries. DynamoDB uses this
+            # token to make identical transaction retries idempotent.
+            "ClientRequestToken": uuid.uuid4().hex,
         }
 
-        try:
-            transact(**request)
-        except Exception as exc:
-            response = getattr(exc, "response", None)
-            error = response.get("Error", {}) if isinstance(response, dict) else {}
-            if not isinstance(error, dict) or error.get("Code") != "TransactionCanceledException":
-                raise
+        # Measure the recovery interval from the first transaction attempt.
+        first_attempt_at = time.monotonic()
 
-            reasons = response.get("CancellationReasons", [])
-            if not isinstance(reasons, list) or len(reasons) != 2:
-                raise
+        for attempt in range(_MAX_TRANSACTION_ATTEMPTS):
+            try:
+                transact(**request)
+                return "accepted"
 
-            codes = [
-                item.get("Code") if isinstance(item, dict) else None
-                for item in reasons
-            ]
-            if codes[0] == "ConditionalCheckFailed":
-                return "replay"
-            if codes[1] == "ConditionalCheckFailed":
-                return "stale"
-            raise
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                error = (
+                    response.get("Error", {})
+                    if isinstance(response, dict)
+                    else {}
+                )
+                code = error.get("Code") if isinstance(error, dict) else None
 
-        return "accepted"
+                transaction_in_progress = (
+                    code == "TransactionInProgressException"
+                )
+
+                retryable = transaction_in_progress or (
+                    code == "TransactionConflictException"
+                )
+
+                if code == "TransactionCanceledException":
+                    reasons = response.get("CancellationReasons", [])
+
+                    if not isinstance(reasons, list) or len(reasons) != 2:
+                        raise
+
+                    codes = [
+                        item.get("Code") if isinstance(item, dict) else None
+                        for item in reasons
+                    ]
+
+                    if "TransactionConflict" in codes:
+                        retryable = True
+                    elif codes[0] == "ConditionalCheckFailed":
+                        return "replay"
+                    elif codes[1] == "ConditionalCheckFailed":
+                        return "stale"
+                    else:
+                        raise
+
+                if not retryable or attempt == _MAX_TRANSACTION_ATTEMPTS - 1:
+                    raise
+
+                if transaction_in_progress:
+                    elapsed = time.monotonic() - first_attempt_at
+                    remaining = (
+                        _TRANSACTION_IN_PROGRESS_RECOVERY_SECONDS - elapsed
+                    )
+
+                    if remaining > 0:
+                        time.sleep(remaining)
+                else:
+                    ceiling = min(
+                        _TRANSACTION_BACKOFF_BASE_SECONDS * (2**attempt),
+                        _TRANSACTION_BACKOFF_MAX_SECONDS,
+                    )
+                    time.sleep(random.uniform(0, ceiling))
+
+        raise RuntimeError("DynamoDB transaction retry loop exited unexpectedly")
