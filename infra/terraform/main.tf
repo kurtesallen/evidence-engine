@@ -425,11 +425,14 @@ data "aws_iam_policy_document" "consumer_permissions" {
     }
   }
 
-  # Conditional PutItem on bundle_digest provides atomic replay detection.
+  # Supports legacy single-item acceptance and atomic ordered acceptance.
   statement {
-    sid       = "RecordAcceptedBundleDigest"
-    effect    = "Allow"
-    actions   = ["dynamodb:PutItem"]
+    sid    = "RecordAcceptedBundleDigest"
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:TransactWriteItems",
+    ]
     resources = [aws_dynamodb_table.acceptance.arn]
   }
 

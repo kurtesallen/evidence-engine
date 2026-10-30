@@ -6,6 +6,10 @@ import os
 import subprocess
 import sys
 import shutil
+import hashlib
+
+from evidence_engine.aws.acceptance import DynamoDBAcceptanceState
+from evidence_engine.aws.config import create_acceptance_state
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -411,6 +415,76 @@ def assert_negative_paths(
 
         print("PASS: tampered plan.json rejected by digest verification.")
 
+def assert_dynamodb_rollback_protection() -> None:
+    """Test ordered rollback protection using an isolated DynamoDB identity."""
+    if require_env("EVIDENCE_ENGINE_ACCEPTANCE_BACKEND").lower() != "dynamodb":
+        raise RuntimeError("Rollback test requires DynamoDB")
+
+    run_id = require_env("GITHUB_RUN_ID")
+    run_attempt = require_env("GITHUB_RUN_ATTEMPT")
+
+    consumer_id = f"rollback-test-{run_id}-{run_attempt}"
+    stream_id = "evidence-rollback-test"
+
+    if consumer_id == require_env("EVIDENCE_ENGINE_CONSUMER_ID"):
+        raise RuntimeError("Rollback consumer identity collision")
+
+    if stream_id == require_env("EVIDENCE_ENGINE_EXPECTED_STREAM_ID"):
+        raise RuntimeError("Rollback stream identity collision")
+
+    acceptance = create_acceptance_state(environ=os.environ)
+
+    if not isinstance(acceptance, DynamoDBAcceptanceState):
+        raise RuntimeError("DynamoDB acceptance backend was not constructed")
+
+    def digest(label: str) -> str:
+        value = f"rollback:{run_id}:{run_attempt}:{label}"
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    identity = {
+        "consumer_id": consumer_id,
+        "stream_id": stream_id,
+    }
+
+    result = acceptance.accept_ordered(
+        digest("newer"),
+        run_number=3,
+        run_attempt=1,
+        **identity,
+    )
+    if result != "accepted":
+        raise RuntimeError(f"Expected accepted, got {result}")
+
+    print("PASS: newer synthetic run accepted into isolated DynamoDB checkpoint.")
+
+    result = acceptance.accept_ordered(
+        digest("older"),
+        run_number=1,
+        run_attempt=1,
+        **identity,
+    )
+    if result != "stale":
+        raise RuntimeError(f"Expected older run to be stale, got {result}")
+
+    print("PASS: older synthetic run rejected as stale.")
+
+    result = acceptance.accept_ordered(
+        digest("intermediate"),
+        run_number=2,
+        run_attempt=1,
+        **identity,
+    )
+    if result != "stale":
+        raise RuntimeError(
+            f"Checkpoint regression detected; expected stale, got {result}"
+        )
+
+    print(
+        "PASS: intermediate synthetic run rejected; "
+        "checkpoint remained at the newer position."
+    )
+
+
 def consume() -> None:
     require_env("AWS_REGION")
     require_env("EVIDENCE_ENGINE_S3_BUCKET")
@@ -434,6 +508,7 @@ def consume() -> None:
     )
 
     assert_negative_paths(payload, consumer, signing_key_id)
+    assert_dynamodb_rollback_protection()
     first = consumer.run(payload)
     if not first.success:
         raise RuntimeError(
@@ -451,7 +526,6 @@ def consume() -> None:
         )
     print("Second consumption: duplicate bundle rejected as replay.")
     print(f"Accepted manifest digest: {first.audit.get('bundle_digest', 'unreported')}")
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(
