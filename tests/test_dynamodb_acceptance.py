@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from evidence_engine.aws.acceptance import DynamoDBAcceptanceState
@@ -17,13 +19,15 @@ class FakeDynamoDBError(Exception):
 
 class FakeDynamoDBClient:
     def __init__(self) -> None:
-        self.calls: list[dict] = []
+        self.calls: list[dict[str, Any]] = []
         self.error: Exception | None = None
 
-    def put_item(self, **kwargs):
+    def put_item(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
+
         if self.error is not None:
             raise self.error
+
         return {}
 
 
@@ -35,6 +39,7 @@ def test_first_acceptance_writes_digest_conditionally() -> None:
     assert len(client.calls) == 1
 
     call = client.calls[0]
+
     assert call["TableName"] == "acceptance-state"
     assert call["Item"] == {
         "pk": {"S": "LEGACY_GLOBAL"},
@@ -49,14 +54,17 @@ def test_first_acceptance_writes_digest_conditionally() -> None:
 def test_existing_digest_returns_false() -> None:
     client = FakeDynamoDBClient()
     client.error = FakeDynamoDBError("ConditionalCheckFailedException")
+
     state = DynamoDBAcceptanceState(client, "acceptance-state")
 
     assert state.accept_once(VALID_DIGEST) is False
+    assert len(client.calls) == 1
 
 
 def test_unexpected_storage_error_propagates() -> None:
     client = FakeDynamoDBClient()
     client.error = FakeDynamoDBError("AccessDeniedException")
+
     state = DynamoDBAcceptanceState(client, "acceptance-state")
 
     with pytest.raises(FakeDynamoDBError):
@@ -74,7 +82,7 @@ def test_unexpected_storage_error_propagates() -> None:
         None,
     ],
 )
-def test_invalid_digest_is_rejected_before_write(digest) -> None:
+def test_invalid_digest_is_rejected_before_write(digest: Any) -> None:
     client = FakeDynamoDBClient()
     state = DynamoDBAcceptanceState(client, "acceptance-state")
 

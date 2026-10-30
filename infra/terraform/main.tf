@@ -425,13 +425,15 @@ data "aws_iam_policy_document" "consumer_permissions" {
     }
   }
 
-  # Supports legacy single-item acceptance and atomic ordered acceptance.
+  # Supports legacy single-item acceptance, atomic ordered acceptance,
+  # and strongly consistent checkpoint inspection in the synthetic E2E test.
   statement {
-    sid    = "RecordAcceptedBundleDigest"
+    sid    = "RecordAndInspectAcceptedBundleState"
     effect = "Allow"
     actions = [
       "dynamodb:PutItem",
       "dynamodb:TransactWriteItems",
+      "dynamodb:GetItem",
     ]
     resources = [aws_dynamodb_table.acceptance.arn]
   }
