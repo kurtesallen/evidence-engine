@@ -204,5 +204,5 @@ jobs:
               ;;
           esac
 
-      - name: Verify tampering, reject unauthorized source, accept, and reject replay
+      - name: Verify tampering, trust policy, rollback, acceptance, and replay
         run: python scripts/e2e_synthetic_aws.py consume

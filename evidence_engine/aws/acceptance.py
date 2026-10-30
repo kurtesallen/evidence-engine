@@ -13,10 +13,11 @@ AcceptanceOutcome = Literal["accepted", "replay", "stale"]
 
 
 class DynamoDBAcceptanceState:
-    """Atomically record accepted bundle digests in a DynamoDB table.
+    """Atomically record bundle acceptance in a DynamoDB table.
 
     The supplied DynamoDB client must be a boto3 low-level client.
-    The table must have a string partition key named ``bundle_digest``.
+    The table must have a string partition key named ``pk`` and a
+    string sort key named ``sk``.
     """
 
     def __init__(self, client: Any, table_name: str) -> None:
