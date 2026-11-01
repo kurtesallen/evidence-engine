@@ -1,7 +1,4 @@
-
-"""
-Seal and verify hardened EvidenceEngine bundles.
-"""
+"""Seal and verify hardened EvidenceEngine bundles."""
 
 import argparse
 import os
@@ -32,6 +29,7 @@ from evidence_engine.trust import resolve_trusted_key
 # Sealing
 # ---------------------------------------------------------------------------
 
+
 def seal(
     artifacts: Path,
     output: Path,
@@ -40,6 +38,8 @@ def seal(
     signing_mode: str = "local",
     kms_key_id: str | None = None,
     aws_region: str = "us-east-1",
+    terraform_root: Path | None = None,
+    require_provider_lock: bool = False,
 ) -> None:
     """
     Create a canonical, signed evidence manifest.
@@ -48,8 +48,12 @@ def seal(
     KMS mode uses an AWS KMS asymmetric signing key.
 
     Local manifests use schema v1.1.
-    GitHub Actions manifests use schema v1.2 and include
+    GitHub Actions manifests use schema v1.3 and include
     CI ordering and workflow provenance claims.
+
+    When terraform_root is supplied, the provider lockfile digest
+    is included in provenance. GitHub Actions sealing requires
+    both an explicit Terraform root and its provider lockfile.
     """
     repository = Path.cwd().resolve()
 
@@ -78,10 +82,12 @@ def seal(
     # CI sealing uses schema v1.3 with ordered provenance and stream ID.
     schema_version = "1.1"
 
+    is_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
     # ----------------------------------------------------------------------
     # CI provenance validation
     # ----------------------------------------------------------------------
-    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+    if is_ci:
         context = capture_ci_context()
 
         try:
@@ -114,7 +120,22 @@ def seal(
                 "CI commit SHA does not match checked-out Git commit"
             )
 
-        provenance = provenance_for(repository)
+        # Require the Terraform root and provider lockfile in CI.
+        # Perform this check after validating the checkout commit so
+        # existing CI integrity checks retain their precedence.
+        if terraform_root is None:
+            raise ValueError(
+                "A Terraform root is required when sealing in GitHub Actions"
+            )
+
+        require_provider_lock = True
+
+        provenance = provenance_for(
+            repository,
+            terraform_root=terraform_root,
+            require_provider_lock=require_provider_lock,
+        )
+
         provenance["repository"] = context["repository"]
         provenance["commit_sha"] = context["commit_sha"]
         provenance["workflow_run_id"] = context["run_id"]
@@ -128,8 +149,13 @@ def seal(
         provenance["stream_id"] = context["stream_id"]
 
         schema_version = "1.3"
+
     else:
-        provenance = provenance_for(repository)
+        provenance = provenance_for(
+            repository,
+            terraform_root=terraform_root,
+            require_provider_lock=require_provider_lock,
+        )
 
     # ----------------------------------------------------------------------
     # Output directory and manifest creation
@@ -169,6 +195,7 @@ def seal(
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
+
 
 def verify_bundle(
     artifacts: Path,
@@ -285,6 +312,7 @@ def verify_bundle(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     """Parse CLI arguments and run the requested operation."""
     parser = argparse.ArgumentParser(
@@ -332,6 +360,16 @@ def main() -> None:
         default="us-east-1",
         help="AWS region containing the KMS key.",
     )
+    seal_parser.add_argument(
+        "--terraform-root",
+        type=Path,
+        help="Terraform configuration root containing .terraform.lock.hcl.",
+    )
+    seal_parser.add_argument(
+        "--require-provider-lock",
+        action="store_true",
+        help="Fail if the Terraform root or provider lockfile is missing.",
+    )
 
     # ----------------------------------------------------------------------
     # Verify command
@@ -376,6 +414,8 @@ def main() -> None:
                 signing_mode=args.signing_mode,
                 kms_key_id=args.kms_key_id,
                 aws_region=args.aws_region,
+                terraform_root=args.terraform_root,
+                require_provider_lock=args.require_provider_lock,
             )
             return
 
