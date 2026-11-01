@@ -75,3 +75,28 @@ def capture_provenance(repository: Path) -> dict[str, str]:
         "provider_lock_sha256": lock_digest,
         "source": source,
     }
+
+
+def provider_lock_digest(
+    terraform_root: Path,
+    *,
+    required: bool = False,
+) -> str:
+    """Return the SHA-256 digest of a Terraform root's provider lockfile."""
+    root = Path(terraform_root).resolve()
+
+    if not root.is_dir():
+        raise ValueError(
+            f"Terraform root must be an existing directory: {terraform_root}"
+        )
+
+    lock_path = root / ".terraform.lock.hcl"
+
+    if not lock_path.is_file():
+        if required:
+            raise ValueError(
+                f"Required Terraform provider lockfile not found: {lock_path}"
+            )
+        return ""
+
+    return hashlib.sha256(lock_path.read_bytes()).hexdigest()
