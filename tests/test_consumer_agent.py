@@ -12,6 +12,10 @@ from evidence_engine.schema import REQUIRED_ARTIFACTS
 
 def make_consumer(root, **kwargs):
     kwargs.setdefault("acceptance_state", InMemoryAcceptanceState())
+    kwargs.setdefault(
+        "trust_registry_path",
+        root.parent / "consumer-trust.json",
+    )
     return ConsumerAgent(root, **kwargs)
 
 
@@ -55,7 +59,9 @@ def consumer_setup(tmp_path, monkeypatch):
         "artifacts_root": str(root),
         "manifest_path": str(manifest_path),
         "signature_path": str(tmp_path / "manifest.sig"),
-        "trust_registry_path": str(tmp_path / "trust.json"),
+        # Deliberately untrusted metadata. Consumer configuration must
+        # provide the trust anchor instead.
+        "trust_registry_path": str(tmp_path / "receipt-selected-trust.json"),
         "source": "local-claimed",
         "artifacts": [
             "plan.json",
@@ -191,6 +197,29 @@ def test_consumer_verifies_matching_receipt(consumer_setup):
     assert result.data == {"verified": True, "key_id": "test-key"}
     assert len(calls) == 1
 
+    # The trust registry must come from consumer configuration, not
+    # from the receipt's trust_registry_path field.
+    assert Path(calls[0][3]) == root.parent / "consumer-trust.json"
+    assert Path(calls[0][3]) != Path(receipt["trust_registry_path"])
+
+
+def test_consumer_rejects_receipt_registry_without_local_configuration(
+    consumer_setup,
+):
+    root, receipt, calls = consumer_setup
+
+    consumer = ConsumerAgent(
+        root,
+        expected_key_id="test-key",
+        acceptance_state=InMemoryAcceptanceState(),
+    )
+
+    result = consumer.run(receipt)
+
+    assert result.success is False
+    assert result.error == "trusted-registry-missing"
+    assert calls == []
+
 
 @pytest.mark.parametrize(
     ("field", "value", "expected_error"),
@@ -266,7 +295,7 @@ def test_consumer_rejects_replayed_bundle(consumer_setup):
     root, receipt, calls = consumer_setup
     state = InMemoryAcceptanceState()
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
         acceptance_state=state,
@@ -289,7 +318,7 @@ def test_consumer_fails_closed_when_acceptance_state_errors(consumer_setup):
         def accept_once(self, bundle_digest: str) -> bool:
             raise RuntimeError("simulated storage failure")
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
         acceptance_state=BrokenAcceptanceState(),
@@ -309,11 +338,10 @@ def test_remote_consumer_downloads_verifies_and_accepts(
     storage = FakeRemoteStorage()
     trust_registry = tmp_path / "consumer-trust.json"
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_source="local-claimed",
         expected_key_id="test-key",
-        acceptance_state=InMemoryAcceptanceState(),
         bundle_storage=storage,
         trust_registry_path=trust_registry,
     )
@@ -376,10 +404,9 @@ def test_remote_consumer_fails_closed_on_download_error(
     root, producer_receipt, verify_calls = consumer_setup
     storage = FakeRemoteStorage(fail=True)
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
-        acceptance_state=InMemoryAcceptanceState(),
         bundle_storage=storage,
         trust_registry_path=tmp_path / "consumer-trust.json",
     )
@@ -395,6 +422,7 @@ def test_remote_consumer_fails_closed_on_download_error(
     assert result.error == "bundle-download-failed"
     assert result.audit["exception_type"] == "RuntimeError"
     assert verify_calls == []
+
 
 def _write_v13_receipt(
     receipt,
@@ -430,10 +458,9 @@ def test_v13_consumer_requires_ordered_acceptance_configuration(
     root, receipt, _ = consumer_setup
     _write_v13_receipt(receipt)
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
-        acceptance_state=InMemoryAcceptanceState(),
     )
 
     result = consumer.run(receipt)
@@ -446,10 +473,9 @@ def test_v13_consumer_rejects_unexpected_stream(consumer_setup):
     root, receipt, _ = consumer_setup
     _write_v13_receipt(receipt, stream_id="terraform-production")
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
-        acceptance_state=InMemoryAcceptanceState(),
         consumer_id="consumer-a",
         expected_stream_id="terraform-staging",
     )
@@ -465,7 +491,7 @@ def test_v13_consumer_rejects_replay_and_stale_run(consumer_setup):
     state = InMemoryAcceptanceState()
     _write_v13_receipt(receipt, run_number="42", run_attempt="1")
 
-    consumer = ConsumerAgent(
+    consumer = make_consumer(
         root,
         expected_key_id="test-key",
         acceptance_state=state,

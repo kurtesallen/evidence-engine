@@ -24,6 +24,9 @@ class ConsumerAgent(Agent):
     BundleReference, downloads the referenced S3 object versions, and
     verifies the downloaded bundle using a locally configured trust registry.
 
+    A locally configured trust registry is mandatory for both local and
+    remote consumption. Receipt metadata can never select the trusted keys.
+
     When require_remote_bundle is enabled, local receipts are rejected.
     """
 
@@ -189,7 +192,7 @@ class ConsumerAgent(Agent):
 
                 # Keep the producer's receipt metadata, but replace bundle
                 # paths with paths inside the downloaded bundle.
-                # The trust registry always comes from local configuration.
+                # The trust registry is obtained only from local config.
                 normalized_receipt = dict(raw_metadata)
                 normalized_receipt["artifacts_root"] = str(
                     downloaded_artifacts
@@ -199,9 +202,6 @@ class ConsumerAgent(Agent):
                 )
                 normalized_receipt["signature_path"] = str(
                     bundle_dir / "manifest.sig"
-                )
-                normalized_receipt["trust_registry_path"] = str(
-                    self._trust_registry_path
                 )
 
                 # Verify and record acceptance before temporary files
@@ -237,6 +237,18 @@ class ConsumerAgent(Agent):
                 {},
             )
 
+        # The trust anchor must come from consumer configuration, never
+        # from receipt metadata. This applies to local and remote receipts.
+        if self._trust_registry_path is None:
+            return AgentResult(
+                False,
+                None,
+                "trusted-registry-missing",
+                {},
+            )
+
+        trust_registry_path = self._trust_registry_path
+
         try:
             manifest_path = Path(receipt["manifest_path"])
             signature_path = Path(receipt["signature_path"])
@@ -244,15 +256,6 @@ class ConsumerAgent(Agent):
             receipt_root = Path(receipt["artifacts_root"])
             receipt_artifacts = receipt["artifacts"]
             receipt_key_id = receipt["signature_key_id"]
-
-            if self._trust_registry_path is not None:
-                trust_registry_path = self._trust_registry_path
-            else:
-                # Backward compatibility for local receipts.
-                # Remote mode requires a locally configured registry.
-                trust_registry_path = Path(
-                    receipt["trust_registry_path"]
-                )
 
         except (KeyError, TypeError, ValueError):
             return AgentResult(
