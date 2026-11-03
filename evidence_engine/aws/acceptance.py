@@ -1,4 +1,3 @@
-
 """DynamoDB-backed acceptance state for shared replay detection."""
 
 from __future__ import annotations
@@ -19,6 +18,35 @@ _MAX_TRANSACTION_ATTEMPTS = 6
 _TRANSACTION_BACKOFF_BASE_SECONDS = 0.025
 _TRANSACTION_BACKOFF_MAX_SECONDS = 0.5
 _TRANSACTION_IN_PROGRESS_RECOVERY_SECONDS = 5.0
+
+
+def _is_ambiguous_transport_error(exc: Exception) -> bool:
+    """Return whether a transport failure may have hidden a committed write.
+
+    Import botocore lazily so this optional adapter remains importable in
+    environments that do not install boto3/botocore.
+    """
+    try:
+        from botocore.exceptions import (
+            ConnectionClosedError,
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            HTTPClientError,
+            ReadTimeoutError,
+        )
+    except ImportError:
+        return False
+
+    return isinstance(
+        exc,
+        (
+            ConnectionClosedError,
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            HTTPClientError,
+            ReadTimeoutError,
+        ),
+    )
 
 
 class DynamoDBAcceptanceState:
@@ -78,6 +106,52 @@ class DynamoDBAcceptanceState:
 
         return True
 
+    def _digest_was_committed(
+        self,
+        bundle_digest: str,
+        *,
+        consumer_id: str,
+        stream_id: str,
+        request_token: str,
+    ) -> bool:
+        """Confirm that this specific ambiguous transaction committed.
+
+        A strongly consistent read can confirm the write only when the
+        persisted request token matches the transaction being recovered.
+
+        An absent record, mismatched token, or failed read is inconclusive.
+        """
+        get_item = getattr(self._client, "get_item", None)
+        if not callable(get_item):
+            return False
+
+        try:
+            response = get_item(
+                TableName=self._table_name,
+                Key={
+                    "pk": {"S": f"CONSUMER#{consumer_id}"},
+                    "sk": {"S": f"DIGEST#{bundle_digest}"},
+                },
+                ConsistentRead=True,
+            )
+        except Exception:
+            # The caller preserves and re-raises the original transport error.
+            return False
+
+        if not isinstance(response, dict):
+            return False
+
+        item = response.get("Item")
+        if not isinstance(item, dict):
+            return False
+
+        return (
+            item.get("record_type") == {"S": "DIGEST"}
+            and item.get("bundle_digest") == {"S": bundle_digest}
+            and item.get("stream_id") == {"S": stream_id}
+            and item.get("acceptance_request_token") == {"S": request_token}
+        )
+
     def accept_ordered(
         self,
         bundle_digest: str,
@@ -114,12 +188,15 @@ class DynamoDBAcceptanceState:
         if not callable(transact):
             raise TypeError("client must provide transact_write_items")
 
+        client_request_token = uuid.uuid4().hex
+
         digest_item = {
             "pk": {"S": f"CONSUMER#{consumer_id}"},
             "sk": {"S": f"DIGEST#{bundle_digest}"},
             "record_type": {"S": "DIGEST"},
             "bundle_digest": {"S": bundle_digest},
             "stream_id": {"S": stream_id},
+            "acceptance_request_token": {"S": client_request_token},
         }
 
         checkpoint_item = {
@@ -162,9 +239,9 @@ class DynamoDBAcceptanceState:
                     }
                 },
             ],
-            # Generate once and preserve across retries. DynamoDB uses this
-            # token to make identical transaction retries idempotent.
-            "ClientRequestToken": uuid.uuid4().hex,
+            # Keep this token and the transaction payload unchanged across
+            # retries so DynamoDB can recognize identical transaction attempts.
+            "ClientRequestToken": client_request_token,
         }
 
         # Measure the recovery interval from the first transaction attempt.
@@ -183,6 +260,19 @@ class DynamoDBAcceptanceState:
                     else {}
                 )
                 code = error.get("Code") if isinstance(error, dict) else None
+
+                if _is_ambiguous_transport_error(exc):
+                    if self._digest_was_committed(
+                        bundle_digest,
+                        consumer_id=consumer_id,
+                        stream_id=stream_id,
+                        request_token=client_request_token,
+                    ):
+                        return "accepted"
+
+                    # An absent record, mismatched token, or failed read is
+                    # inconclusive. Preserve the original transport exception.
+                    raise
 
                 transaction_in_progress = (
                     code == "TransactionInProgressException"

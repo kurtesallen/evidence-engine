@@ -1,4 +1,7 @@
+"""Tests for DynamoDB-backed ordered acceptance and replay detection."""
+
 import pytest
+from botocore.exceptions import ReadTimeoutError
 
 from evidence_engine.aws.acceptance import DynamoDBAcceptanceState
 
@@ -19,6 +22,9 @@ class FakeDynamoDBClient:
         self.calls = []
         self.error = None
         self.errors = []
+        self.get_item_calls = []
+        self.get_item_response = {}
+        self.get_item_error = None
 
     def put_item(self, **kwargs):
         return {}
@@ -33,6 +39,19 @@ class FakeDynamoDBClient:
             raise self.error
 
         return {}
+
+    def get_item(self, **kwargs):
+        self.get_item_calls.append(kwargs)
+
+        if self.get_item_error is not None:
+            raise self.get_item_error
+
+        response = self.get_item_response
+        if callable(response):
+            return response(kwargs)
+
+        return response
+
 
 def make_state(client):
     return DynamoDBAcceptanceState(client, "acceptance-state")
@@ -64,11 +83,17 @@ def test_ordered_acceptance_uses_atomic_transaction():
 
     assert digest_put["Item"]["sk"] == {"S": f"DIGEST#{DIGEST}"}
     assert "attribute_not_exists" in digest_put["ConditionExpression"]
+
     assert checkpoint_put["Item"]["sk"] == {
         "S": "CHECKPOINT#terraform-production"
     }
     assert "#rn < :rn" in checkpoint_put["ConditionExpression"]
     assert "#ra < :ra" in checkpoint_put["ConditionExpression"]
+
+    assert (
+        digest_put["Item"]["acceptance_request_token"]["S"]
+        == client.calls[0]["ClientRequestToken"]
+    )
 
 
 def test_ordered_acceptance_reports_replay():
@@ -128,7 +153,10 @@ def test_ordered_acceptance_validates_input(field, value):
 
     assert client.calls == []
 
-def test_ordered_acceptance_retries_transient_transaction_conflicts(monkeypatch):
+
+def test_ordered_acceptance_retries_transient_transaction_conflicts(
+    monkeypatch,
+):
     client = FakeDynamoDBClient()
     conflict = FakeDynamoDBError(
         "TransactionCanceledException",
@@ -158,9 +186,7 @@ def test_ordered_acceptance_reuses_client_request_token_across_retries(
 ):
     client = FakeDynamoDBClient()
     client.errors = [
-        FakeDynamoDBError(
-            "TransactionConflictException",
-        ),
+        FakeDynamoDBError("TransactionConflictException"),
     ]
 
     sleeps = []
@@ -189,6 +215,10 @@ def test_ordered_acceptance_reuses_client_request_token_across_retries(
     assert len(first_token) == 32
     assert len(sleeps) == 1
 
+    digest_item = client.calls[0]["TransactItems"][0]["Put"]["Item"]
+    assert digest_item["acceptance_request_token"] == {
+        "S": first_token
+    }
 
 
 def test_ordered_acceptance_retries_transaction_in_progress(
@@ -252,9 +282,7 @@ def test_ordered_acceptance_retries_transaction_in_progress(
     )
 
 
-def test_ordered_acceptance_stops_after_maximum_retries(
-    monkeypatch,
-):
+def test_ordered_acceptance_stops_after_maximum_retries(monkeypatch):
     from evidence_engine.aws.acceptance import (
         _MAX_TRANSACTION_ATTEMPTS,
     )
@@ -328,3 +356,105 @@ def test_ordered_acceptance_does_not_retry_conditional_failures(
 
     assert result == expected
     assert len(client.calls) == 1
+
+
+def test_ambiguous_transaction_returns_accepted_when_digest_is_committed():
+    client = FakeDynamoDBClient()
+    client.error = ReadTimeoutError(
+        endpoint_url="https://dynamodb.us-east-1.amazonaws.com",
+        error="read timed out",
+    )
+    client.get_item_response = lambda _kwargs: {
+        "Item": {
+            "record_type": {"S": "DIGEST"},
+            "bundle_digest": {"S": DIGEST},
+            "stream_id": {"S": "terraform-production"},
+            "acceptance_request_token": {
+                "S": client.calls[0]["ClientRequestToken"]
+            },
+        }
+    }
+
+    result = make_state(client).accept_ordered(DIGEST, **ordered_args())
+
+    assert result == "accepted"
+    assert len(client.get_item_calls) == 1
+    assert client.get_item_calls[0]["ConsistentRead"] is True
+    assert client.get_item_calls[0]["Key"] == {
+        "pk": {"S": "CONSUMER#consumer-a"},
+        "sk": {"S": f"DIGEST#{DIGEST}"},
+    }
+
+
+def test_ambiguous_transaction_propagates_when_digest_is_absent():
+    client = FakeDynamoDBClient()
+    error = ReadTimeoutError(
+        endpoint_url="https://dynamodb.us-east-1.amazonaws.com",
+        error="read timed out",
+    )
+    client.error = error
+    client.get_item_response = {}
+
+    with pytest.raises(ReadTimeoutError) as exc_info:
+        make_state(client).accept_ordered(DIGEST, **ordered_args())
+
+    assert exc_info.value is error
+    assert len(client.get_item_calls) == 1
+
+
+def test_ambiguous_transaction_preserves_original_error_when_reconciliation_fails():
+    client = FakeDynamoDBClient()
+    original_error = ReadTimeoutError(
+        endpoint_url="https://dynamodb.us-east-1.amazonaws.com",
+        error="transaction response lost",
+    )
+    client.error = original_error
+    client.get_item_error = RuntimeError("reconciliation read failed")
+
+    with pytest.raises(ReadTimeoutError) as exc_info:
+        make_state(client).accept_ordered(DIGEST, **ordered_args())
+
+    assert exc_info.value is original_error
+    assert len(client.get_item_calls) == 1
+
+
+def test_ambiguous_transaction_does_not_accept_mismatched_digest_record():
+    client = FakeDynamoDBClient()
+    client.error = ReadTimeoutError(
+        endpoint_url="https://dynamodb.us-east-1.amazonaws.com",
+        error="read timed out",
+    )
+    client.get_item_response = {
+        "Item": {
+            "record_type": {"S": "DIGEST"},
+            "bundle_digest": {"S": DIGEST},
+            "stream_id": {"S": "different-stream"},
+            "acceptance_request_token": {"S": "some-other-token"},
+        }
+    }
+
+    with pytest.raises(ReadTimeoutError):
+        make_state(client).accept_ordered(DIGEST, **ordered_args())
+
+    assert len(client.get_item_calls) == 1
+
+
+def test_ambiguous_transaction_does_not_accept_previous_digest_record():
+    client = FakeDynamoDBClient()
+    client.error = ReadTimeoutError(
+        endpoint_url="https://dynamodb.us-east-1.amazonaws.com",
+        error="read timed out",
+    )
+    client.get_item_response = {
+        "Item": {
+            "record_type": {"S": "DIGEST"},
+            "bundle_digest": {"S": DIGEST},
+            "stream_id": {"S": "terraform-production"},
+            "acceptance_request_token": {"S": "previous-request-token"},
+        }
+    }
+
+    with pytest.raises(ReadTimeoutError):
+        make_state(client).accept_ordered(DIGEST, **ordered_args())
+
+    assert len(client.get_item_calls) == 1
