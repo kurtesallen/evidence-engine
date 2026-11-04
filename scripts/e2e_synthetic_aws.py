@@ -731,6 +731,26 @@ def assert_dynamodb_concurrent_acceptance() -> None:
         "at run 108."
     )
 
+    # Scenario 4: explicitly prove that a lower run is rejected after
+    # the concurrent race has persisted the highest checkpoint.
+    stale_after_race = acceptance.accept_ordered(
+        digest("out-of-order-after-maximum"),
+        consumer_id=consumer_id,
+        stream_id=ordered_stream,
+        run_number=107,
+        run_attempt=1,
+    )
+
+    if stale_after_race != "stale":
+        raise RuntimeError(
+            "Post-race rollback check failed: expected stale for run 107, "
+            f"got {stale_after_race}"
+        )
+
+    print(
+        "PASS: run 107 rejected after concurrent checkpoint advanced to 108."
+    )
+
 
 def consume() -> None:
     require_env("AWS_REGION")
