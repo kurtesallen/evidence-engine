@@ -28,9 +28,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_REF" != "refs/heads/master" \
-             && "$GITHUB_REF" != "refs/heads/test/e2e-rollback-protection" ]]; then
-            echo "::error::This integration workflow may only run from master or test/e2e-rollback-protection."
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::This integration workflow may only run from master."
             exit 1
           fi
 
