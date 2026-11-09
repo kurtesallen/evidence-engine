@@ -518,3 +518,281 @@ def test_v13_consumer_rejects_replay_and_stale_run(consumer_setup):
     newer = consumer.run(receipt)
 
     assert newer.success is True
+
+# ---------------------------------------------------------------------------
+# Immutable-generation consumer tests
+# ---------------------------------------------------------------------------
+
+from evidence_engine.bundle_publication import (
+    create_staging_generation,
+    publish_generation,
+    resolve_current_generation,
+)
+
+
+def _published_consumer_generation(bundle_root: Path):
+    """Create and publish a structurally complete test generation."""
+    paths = create_staging_generation(bundle_root)
+    paths.artifacts_root.mkdir()
+
+    for name in (
+        "plan.json",
+        "state.json",
+        "commit.txt",
+        "version.txt",
+    ):
+        (paths.artifacts_root / name).write_bytes(b"")
+
+    paths.manifest_path.write_bytes(
+        canonical_json_bytes(valid_manifest())
+    )
+    paths.signature_path.write_bytes(b"test-signature")
+
+    return publish_generation(paths)
+
+
+def _generation_receipt(paths):
+    """Construct a receipt bound to one published generation."""
+    return {
+        "artifacts_root": str(paths.artifacts_root),
+        "manifest_path": str(paths.manifest_path),
+        "signature_path": str(paths.signature_path),
+        "source": "local-claimed",
+        "artifacts": [
+            "plan.json",
+            "state.json",
+            "commit.txt",
+            "version.txt",
+        ],
+        "signature_key_id": "test-key",
+    }
+
+
+def test_consumer_accepts_current_generation(tmp_path, monkeypatch):
+    bundle_root = tmp_path / "bundle"
+    paths = _published_consumer_generation(bundle_root)
+    receipt = _generation_receipt(paths)
+
+    calls = []
+
+    def fake_verify(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        fake_verify,
+    )
+
+    consumer = make_consumer(
+        paths.artifacts_root,
+        expected_key_id="test-key",
+        bundle_root=bundle_root,
+    )
+
+    result = consumer.run(receipt)
+
+    assert result.success is True
+    assert len(calls) == 1
+    assert Path(calls[0][0]) == paths.artifacts_root
+    assert Path(calls[0][1]) == paths.manifest_path
+    assert Path(calls[0][2]) == paths.signature_path
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    [
+        None,
+        "",
+        "../outside\n",
+        "/tmp/other\n",
+        "not-a-generation\n",
+        "a" * 32 + "\nextra\n",
+        "a" * 32 + "\n",
+    ],
+)
+def test_consumer_rejects_invalid_current(
+    tmp_path,
+    monkeypatch,
+    pointer,
+):
+    bundle_root = tmp_path / "bundle"
+    paths = _published_consumer_generation(bundle_root)
+    receipt = _generation_receipt(paths)
+
+    current = bundle_root / "CURRENT"
+
+    if pointer is None:
+        current.unlink()
+    else:
+        current.write_text(pointer, encoding="ascii")
+
+    calls = []
+
+    def fake_verify(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        fake_verify,
+    )
+
+    consumer = make_consumer(
+        paths.artifacts_root,
+        expected_key_id="test-key",
+        bundle_root=bundle_root,
+    )
+
+    result = consumer.run(receipt)
+
+    assert result.success is False
+    assert result.error == "bundle-generation-invalid"
+    assert calls == []
+
+
+def test_consumer_rejects_previous_generation(
+    tmp_path,
+    monkeypatch,
+):
+    bundle_root = tmp_path / "bundle"
+
+    previous = _published_consumer_generation(bundle_root)
+    current = _published_consumer_generation(bundle_root)
+
+    assert previous.generation_id != current.generation_id
+    assert resolve_current_generation(bundle_root) == current
+
+    calls = []
+
+    def fake_verify(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        fake_verify,
+    )
+
+    consumer = make_consumer(
+        current.artifacts_root,
+        expected_key_id="test-key",
+        bundle_root=bundle_root,
+    )
+
+    result = consumer.run(_generation_receipt(previous))
+
+    assert result.success is False
+    assert result.error == "receipt-generation-mismatch"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "artifacts_root",
+        "manifest_path",
+        "signature_path",
+    ],
+)
+def test_consumer_rejects_generation_path_substitution(
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    bundle_root = tmp_path / "bundle"
+    paths = _published_consumer_generation(bundle_root)
+    receipt = _generation_receipt(paths)
+
+    receipt[field] = str(tmp_path / "outside" / field)
+
+    calls = []
+
+    def fake_verify(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        fake_verify,
+    )
+
+    consumer = make_consumer(
+        paths.artifacts_root,
+        expected_key_id="test-key",
+        bundle_root=bundle_root,
+    )
+
+    result = consumer.run(receipt)
+
+    assert result.success is False
+    assert result.error == "receipt-generation-mismatch"
+    assert calls == []
+
+
+def test_consumer_rejects_current_generation_replay(
+    tmp_path,
+    monkeypatch,
+):
+    bundle_root = tmp_path / "bundle"
+    paths = _published_consumer_generation(bundle_root)
+    receipt = _generation_receipt(paths)
+
+    calls = []
+
+    def fake_verify(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        fake_verify,
+    )
+
+    state = InMemoryAcceptanceState()
+
+    consumer = make_consumer(
+        paths.artifacts_root,
+        expected_key_id="test-key",
+        bundle_root=bundle_root,
+        acceptance_state=state,
+    )
+
+    first = consumer.run(receipt)
+    second = consumer.run(receipt)
+
+    assert first.success is True
+    assert second.success is False
+    assert second.error == "bundle-replay-detected"
+    assert first.audit["bundle_digest"] == second.audit["bundle_digest"]
+    assert len(calls) == 2
+
+
+def test_remote_consumer_ignores_local_current_pointer(
+    consumer_setup,
+    tmp_path,
+):
+    root, producer_receipt, verify_calls = consumer_setup
+    storage = FakeRemoteStorage()
+
+    bundle_root = tmp_path / "missing-local-bundle"
+
+    consumer = make_consumer(
+        root,
+        expected_source="local-claimed",
+        expected_key_id="test-key",
+        bundle_storage=storage,
+        bundle_root=bundle_root,
+    )
+
+    result = consumer.run(
+        {
+            "receipt": producer_receipt,
+            "bundle_reference": valid_bundle_reference(),
+        }
+    )
+
+    assert result.success is True
+    assert len(storage.calls) == 1
+    assert len(verify_calls) == 1
+    assert not bundle_root.exists()

@@ -1,4 +1,6 @@
 
+"""Tests for in-memory acceptance and ordered replay protection."""
+
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -21,7 +23,10 @@ def test_distinct_bundles_can_be_accepted():
     assert state.accept_once("b" * 64) is True
 
 
-@pytest.mark.parametrize("digest", ["", "not-a-digest", "A" * 64, None])
+@pytest.mark.parametrize(
+    "digest",
+    ["", "not-a-digest", "A" * 64, None],
+)
 def test_invalid_digest_is_rejected(digest):
     state = InMemoryAcceptanceState()
 
@@ -48,23 +53,38 @@ def test_ordered_acceptance_rejects_replay_and_stale_positions():
     }
 
     assert state.accept_ordered(
-        "a" * 64, **common, run_number=42, run_attempt=1
+        "a" * 64,
+        **common,
+        run_number=42,
+        run_attempt=1,
     ) == "accepted"
 
     assert state.accept_ordered(
-        "a" * 64, **common, run_number=42, run_attempt=1
+        "a" * 64,
+        **common,
+        run_number=42,
+        run_attempt=1,
     ) == "replay"
 
     assert state.accept_ordered(
-        "b" * 64, **common, run_number=41, run_attempt=9
+        "b" * 64,
+        **common,
+        run_number=41,
+        run_attempt=9,
     ) == "stale"
 
     assert state.accept_ordered(
-        "c" * 64, **common, run_number=42, run_attempt=1
+        "c" * 64,
+        **common,
+        run_number=42,
+        run_attempt=1,
     ) == "stale"
 
     assert state.accept_ordered(
-        "d" * 64, **common, run_number=42, run_attempt=2
+        "d" * 64,
+        **common,
+        run_number=42,
+        run_attempt=2,
     ) == "accepted"
 
 

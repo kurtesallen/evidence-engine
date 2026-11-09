@@ -4,10 +4,15 @@ import argparse
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 
+from evidence_engine.agents.artifact_staging import (
+    stage_sanitized_artifacts,
+)
 from evidence_engine.canonical import (
     canonical_json_bytes,
     parse_json_strict,
@@ -20,6 +25,10 @@ from evidence_engine.kms_signing import (
     verify_bytes as kms_verify_bytes,
 )
 from evidence_engine.manifest import sha256_file, write_manifest
+from evidence_engine.policy import PolicyEngine
+from evidence_engine.sanitization import (
+    TERRAFORM_JSON_CONTENT_RULE_VERSION,
+)
 from evidence_engine.schema import validate_manifest
 from evidence_engine.signing import KEY_ID, sign_bytes
 from evidence_engine.trust import resolve_trusted_key
@@ -40,6 +49,7 @@ def seal(
     aws_region: str = "us-east-1",
     terraform_root: Path | None = None,
     require_provider_lock: bool = False,
+    artifact_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     """
     Create a canonical, signed evidence manifest.
@@ -51,15 +61,34 @@ def seal(
     GitHub Actions manifests use schema v1.3 and include
     CI ordering and workflow provenance claims.
 
-    When terraform_root is supplied, the provider lockfile digest
-    is included in provenance. GitHub Actions sealing requires
-    both an explicit Terraform root and its provider lockfile.
+    GitHub Actions sealing requires explicit artifact metadata.
+    Both plan.json and state.json must be sanitized using the
+    configured Terraform JSON sanitization rule.
+
+    When metadata is supplied locally, the same staging and
+    sanitization policy is applied.
+
+    The Terraform version in provenance is derived from the
+    staged plan.json and state.json documents.
     """
     repository = Path.cwd().resolve()
 
-    if not artifacts.is_dir():
+    # Determine the execution environment before validating metadata.
+    is_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+    # Invalidate any previous signature before attempting a reseal.
+    # A failed reseal must not leave an old signature alongside a
+    # potentially updated manifest or artifact set.
+    output.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = output / "manifest.json"
+    signature_path = output / "manifest.sig"
+
+    signature_path.unlink(missing_ok=True)
+
+    if not artifacts.is_dir() or artifacts.is_symlink():
         raise ValueError(
-            f"Artifacts directory does not exist: {artifacts}"
+            "Artifacts path must be an existing, non-symlink directory"
         )
 
     if signing_mode not in {"local", "kms"}:
@@ -82,10 +111,8 @@ def seal(
     # CI sealing uses schema v1.3 with ordered provenance and stream ID.
     schema_version = "1.1"
 
-    is_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
-
     # ----------------------------------------------------------------------
-    # CI provenance validation
+    # Provenance
     # ----------------------------------------------------------------------
     if is_ci:
         context = capture_ci_context()
@@ -120,9 +147,13 @@ def seal(
                 "CI commit SHA does not match checked-out Git commit"
             )
 
-        # Require the Terraform root and provider lockfile in CI.
-        # Perform this check after validating the checkout commit so
-        # existing CI integrity checks retain their precedence.
+        # CI must explicitly declare how every required artifact
+        # is represented and which sanitization rule was applied.
+        if artifact_metadata is None:
+            raise ValueError(
+                "Explicit artifact metadata is required in GitHub Actions"
+            )
+
         if terraform_root is None:
             raise ValueError(
                 "A Terraform root is required when sealing in GitHub Actions"
@@ -158,19 +189,74 @@ def seal(
         )
 
     # ----------------------------------------------------------------------
-    # Output directory and manifest creation
+    # Artifact staging and sanitization
     # ----------------------------------------------------------------------
-    output.mkdir(parents=True, exist_ok=True)
+    sealed_artifacts = artifacts
 
-    manifest_path = output / "manifest.json"
-    signature_path = output / "manifest.sig"
+    # CI publication always requires staging and sanitization.
+    # Local callers retain legacy behavior when metadata is omitted.
+    if is_ci or artifact_metadata is not None:
+        staged_artifacts = output / "artifacts"
 
+        stage_sanitized_artifacts(
+            source_root=artifacts,
+            destination_root=staged_artifacts,
+            artifact_metadata=artifact_metadata,
+        )
+
+        # Read the staged documents after sanitization. This ensures
+        # the manifest records the version contained in the evidence
+        # actually being sealed, rather than caller-supplied provenance.
+        try:
+            plan_document = parse_json_strict(
+                (staged_artifacts / "plan.json").read_bytes()
+            )
+            state_document = parse_json_strict(
+                (staged_artifacts / "state.json").read_bytes()
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(
+                "Unable to read staged Terraform plan/state documents"
+            ) from exc
+
+        if not isinstance(plan_document, dict) or not isinstance(
+            state_document, dict
+        ):
+            raise ValueError(
+                "Staged Terraform plan/state must be JSON objects"
+            )
+
+        plan_version = plan_document.get("terraform_version")
+        state_version = state_document.get("terraform_version")
+
+        if (
+            not isinstance(plan_version, str)
+            or not plan_version.strip()
+            or not isinstance(state_version, str)
+            or not state_version.strip()
+        ):
+            raise ValueError(
+                "Staged Terraform documents must contain terraform_version"
+            )
+
+        if plan_version != state_version:
+            raise ValueError(
+                "Terraform version mismatch between staged plan and state"
+            )
+
+        provenance["terraform_version"] = plan_version
+        sealed_artifacts = staged_artifacts
+
+    # ----------------------------------------------------------------------
+    # Manifest creation
+    # ----------------------------------------------------------------------
     write_manifest(
-        artifacts,
+        sealed_artifacts,
         manifest_path,
         provenance,
         key_id,
         schema_version=schema_version,
+        artifact_metadata=artifact_metadata,
     )
 
     manifest_bytes = manifest_path.read_bytes()
@@ -187,9 +273,162 @@ def seal(
     signature_path.write_bytes(signature)
 
     print(
-        f"Sealed {artifacts} with key ID {key_id} "
+        f"Sealed {sealed_artifacts} with key ID {key_id} "
         f"using {signing_mode} signing (schema v{schema_version})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Terraform provenance verification
+# ---------------------------------------------------------------------------
+
+
+def _verify_terraform_version_provenance(
+    artifacts: Path,
+    manifest: Mapping[str, Any],
+) -> bool:
+    """
+    Verify Terraform artifact representation and version provenance.
+
+    Legacy schema v1.1 bundles with both Terraform artifacts declared
+    as raw or sample retain compatibility.
+
+    All sanitized bundles must declare the currently supported
+    sanitization rule version. Plan and state must both be sanitized,
+    and their Terraform versions must match each other and the
+    manifest provenance.
+
+    Schemas v1.2 and v1.3 require both Terraform artifacts to be
+    sanitized.
+    """
+    schema_version = manifest.get("schema_version")
+
+    entries = {
+        entry["name"]: entry
+        for entry in manifest["artifacts"]
+    }
+
+    plan_entry = entries.get("plan.json")
+    state_entry = entries.get("state.json")
+
+    if not isinstance(plan_entry, Mapping) or not isinstance(
+        state_entry, Mapping
+    ):
+        print("FAIL: Terraform artifact metadata is missing")
+        return False
+
+    plan_representation = plan_entry.get("representation")
+    state_representation = state_entry.get("representation")
+
+    plan_sanitized = plan_representation == "sanitized"
+    state_sanitized = state_representation == "sanitized"
+
+    modern_schema = schema_version in {"1.2", "1.3"}
+
+    # Modern CI schemas must never accept raw or sample Terraform
+    # artifacts, even when both artifacts use the same representation.
+    if modern_schema and not (
+        plan_sanitized and state_sanitized
+    ):
+        print(
+            "FAIL: schema v1.2/v1.3 requires sanitized "
+            "plan.json and state.json"
+        )
+        return False
+
+    # Preserve compatibility for legacy v1.1 bundles.
+    if not plan_sanitized and not state_sanitized:
+        return True
+
+    if not plan_sanitized or not state_sanitized:
+        print(
+            "FAIL: plan and state must both declare "
+            "sanitized representation"
+        )
+        return False
+
+    # Both sanitized artifacts must identify the same supported
+    # sanitization rules.
+    expected_rule_version = (
+        TERRAFORM_JSON_CONTENT_RULE_VERSION
+    )
+
+    for name, entry in (
+        ("plan.json", plan_entry),
+        ("state.json", state_entry),
+    ):
+        rule_version = entry.get("sanitization_rule_version")
+
+        if rule_version != expected_rule_version:
+            print(
+                f"FAIL: unsupported sanitization rule version "
+                f"for {name}: {rule_version!r}"
+            )
+            return False
+
+    provenance = manifest["provenance"]
+    provenance_version = provenance.get("terraform_version")
+
+    if (
+        not isinstance(provenance_version, str)
+        or not provenance_version.strip()
+    ):
+        print(
+            "FAIL: sanitized Terraform bundle lacks "
+            "provenance version"
+        )
+        return False
+
+    try:
+        plan_document = parse_json_strict(
+            (artifacts / "plan.json").read_bytes()
+        )
+        state_document = parse_json_strict(
+            (artifacts / "state.json").read_bytes()
+        )
+    except (OSError, ValueError, TypeError):
+        print(
+            "FAIL: unable to parse Terraform plan/state evidence"
+        )
+        return False
+
+    if not isinstance(plan_document, dict) or not isinstance(
+        state_document, dict
+    ):
+        print(
+            "FAIL: Terraform plan/state evidence "
+            "must be JSON objects"
+        )
+        return False
+
+    plan_version = plan_document.get("terraform_version")
+    state_version = state_document.get("terraform_version")
+
+    if (
+        not isinstance(plan_version, str)
+        or not plan_version.strip()
+        or not isinstance(state_version, str)
+        or not state_version.strip()
+    ):
+        print(
+            "FAIL: Terraform plan/state version is missing"
+        )
+        return False
+
+    if plan_version != state_version:
+        print(
+            "FAIL: Terraform plan/state versions do not match"
+        )
+        return False
+
+    if provenance_version != plan_version:
+        print(
+            "FAIL: Terraform provenance version "
+            "does not match evidence"
+        )
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +455,20 @@ def verify_bundle(
             return False
 
         validate_manifest(manifest)
+
+        # Apply the same fail-closed integrity policy used during signing.
+        # Reject invalid representation metadata before trust resolution
+        # or signature verification.
+        decision = PolicyEngine().evaluate_integrity(
+            manifest=manifest,
+        )
+
+        if not decision.allowed:
+            print(
+                "FAIL: integrity policy rejected manifest: "
+                f"{decision.reason}"
+            )
+            return False
 
         if manifest["key_id"] != expected_key_id:
             print("FAIL: unexpected signing key ID")
@@ -293,6 +546,14 @@ def verify_bundle(
                 print(f"FAIL: digest mismatch: {entry['name']}")
                 return False
 
+        # Independently verify Terraform representation and version
+        # provenance after confirming files match the signed manifest.
+        if not _verify_terraform_version_provenance(
+            artifacts,
+            manifest,
+        ):
+            return False
+
         print(
             "PASS: manifest is canonical and schema-valid "
             f"(v{manifest['schema_version']})"
@@ -314,7 +575,7 @@ def verify_bundle(
 
 
 def main() -> None:
-    """Parse CLI arguments and run the requested operation."""
+    """Parse command-line arguments and run the requested operation."""
     parser = argparse.ArgumentParser(
         description="Seal and verify EvidenceEngine bundles."
     )
@@ -370,6 +631,14 @@ def main() -> None:
         action="store_true",
         help="Fail if the Terraform root or provider lockfile is missing.",
     )
+    seal_parser.add_argument(
+        "--artifact-metadata",
+        type=Path,
+        help=(
+            "JSON file describing the representation and sanitization "
+            "rule version of each artifact."
+        ),
+    )
 
     # ----------------------------------------------------------------------
     # Verify command
@@ -407,6 +676,18 @@ def main() -> None:
 
     try:
         if args.command == "seal":
+            artifact_metadata = None
+
+            if args.artifact_metadata is not None:
+                artifact_metadata = parse_json_strict(
+                    args.artifact_metadata.read_bytes()
+                )
+
+                if not isinstance(artifact_metadata, dict):
+                    raise ValueError(
+                        "Artifact metadata file must contain a JSON object"
+                    )
+
             seal(
                 args.artifacts,
                 args.output,
@@ -416,6 +697,7 @@ def main() -> None:
                 aws_region=args.aws_region,
                 terraform_root=args.terraform_root,
                 require_provider_lock=args.require_provider_lock,
+                artifact_metadata=artifact_metadata,
             )
             return
 
