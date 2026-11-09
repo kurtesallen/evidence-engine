@@ -21,21 +21,25 @@ jobs:
     name: Validate manual test request
     runs-on: ubuntu-latest
     steps:
-      - name: Require master and explicit synthetic-only confirmation
+      - name: Require an approved branch and explicit synthetic-only confirmation
         shell: bash
         env:
           CONFIRM_SYNTHETIC_ONLY: ${{ inputs.confirm_synthetic_only }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
-            echo "::error::This integration workflow may only run from master."
+
+          if [[ "$GITHUB_REF" != "refs/heads/master" \
+             && "$GITHUB_REF" != "refs/heads/test/e2e-rollback-protection" ]]; then
+            echo "::error::This integration workflow may only run from master or test/e2e-rollback-protection."
             exit 1
           fi
+
           if [[ "$CONFIRM_SYNTHETIC_ONLY" != "true" ]]; then
             echo "::error::Confirm synthetic-only execution before running."
             exit 1
           fi
-          echo "Manual synthetic-only test confirmed on master."
+
+          echo "Manual synthetic-only test confirmed on $GITHUB_REF."
 
   produce:
     name: Produce and publish synthetic evidence
@@ -204,5 +208,5 @@ jobs:
               ;;
           esac
 
-      - name: Verify tampering, trust policy, rollback, acceptance, and replay
+      - name: Verify tampering, trust policy, rollback, concurrency, acceptance, and replay
         run: python scripts/e2e_synthetic_aws.py consume

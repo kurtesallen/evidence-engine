@@ -1,3 +1,4 @@
+
 """Explicit configuration for acceptance-state backends."""
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ def create_acceptance_state(
 
     ``client`` and ``client_factory`` are injectable for tests. The
     default AWS client is created lazily, using the standard boto3
-    credential and region configuration chain.
+    credential and region configuration chain, with explicit retry
+    and timeout settings.
     """
     settings = os.environ if environ is None else environ
     backend = settings.get(BACKEND_ENV, "").strip().lower()
@@ -62,25 +64,43 @@ def create_acceptance_state(
         raise ValueError("Provide client or client_factory, not both")
 
     if client is None:
+        client_config = None
+
         if client_factory is None:
             try:
                 boto3 = importlib.import_module("boto3")
+                Config = importlib.import_module(
+                    "botocore.config"
+                ).Config
             except ImportError as exc:
                 raise RuntimeError(
-                    "DynamoDB requires boto3; install with "
+                    "DynamoDB requires boto3 and botocore; install with "
                     "'pip install -e \".[aws]\"'"
                 ) from exc
+
             client_factory = boto3.client
+            client_config = Config(
+                retries={
+                    "mode": "standard",
+                    "total_max_attempts": 3,
+                },
+                connect_timeout=5,
+                read_timeout=15,
+            )
 
         region = (
             settings.get("AWS_REGION", "").strip()
             or settings.get("AWS_DEFAULT_REGION", "").strip()
         )
 
+        client_kwargs: dict[str, Any] = {}
+
         if region:
-            client = client_factory("dynamodb", region_name=region)
-        else:
-            # Let boto3 resolve region from its normal configuration chain.
-            client = client_factory("dynamodb")
+            client_kwargs["region_name"] = region
+
+        if client_config is not None:
+            client_kwargs["config"] = client_config
+
+        client = client_factory("dynamodb", **client_kwargs)
 
     return DynamoDBAcceptanceState(client, table_name)

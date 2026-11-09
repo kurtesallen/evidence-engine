@@ -1,6 +1,8 @@
+
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -45,6 +47,51 @@ def _validate_kms_key_id(kms_key_id: str) -> str:
     return kms_key_id.strip()
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """Reject symlinks in every existing component of a filesystem path.
+
+    The path is made absolute without resolving symlinks. This preserves
+    the components that need to be inspected. is_symlink() also detects
+    dangling symlinks, unlike an exists()-guarded check.
+    """
+    try:
+        absolute = path.absolute()
+        current = Path(absolute.anchor)
+
+        for part in absolute.parts[1:]:
+            current = current / part
+
+            if current.is_symlink():
+                raise ValueError(
+                    f"Filesystem path cannot contain symlinks: {current}"
+                )
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(
+            f"Unable to inspect filesystem path components: {path}"
+        ) from exc
+
+
+def _set_private_mode(path: Path, mode: int) -> None:
+    """Apply restrictive permissions on POSIX platforms."""
+    if os.name == "posix":
+        path.chmod(mode)
+
+
+def _write_private_file(path: Path, content: bytes) -> None:
+    """Create a new file with owner-only permissions where supported."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    _set_private_mode(path, 0o600)
+
+
 class S3BundleStorage:
     """Store and retrieve evidence bundles using S3 SSE-KMS encryption.
 
@@ -73,7 +120,9 @@ class S3BundleStorage:
 
     @staticmethod
     def _read_file(path: Path) -> bytes:
-        """Read a regular file, rejecting symlinks and non-files."""
+        """Read a regular file, rejecting symlinks in its full path."""
+        _reject_symlink_components(path)
+
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"Bundle input is not a regular file: {path}")
 
@@ -110,6 +159,14 @@ class S3BundleStorage:
         _, prefix = _validate_location(self._bucket, prefix)
 
         artifacts_root = Path(artifacts_root)
+        manifest_path = Path(manifest_path)
+        signature_path = Path(signature_path)
+
+        # Reject symlinks anywhere in each input path before checking or
+        # reading files. This includes symlinked parent directories.
+        _reject_symlink_components(artifacts_root)
+        _reject_symlink_components(manifest_path)
+        _reject_symlink_components(signature_path)
 
         if not artifacts_root.is_dir() or artifacts_root.is_symlink():
             raise ValueError("artifacts_root must be a regular directory")
@@ -133,8 +190,8 @@ class S3BundleStorage:
             )
 
         payloads: dict[str, bytes] = {
-            f"{prefix}/manifest.json": self._read_file(Path(manifest_path)),
-            f"{prefix}/manifest.sig": self._read_file(Path(signature_path)),
+            f"{prefix}/manifest.json": self._read_file(manifest_path),
+            f"{prefix}/manifest.sig": self._read_file(signature_path),
         }
 
         for name in sorted(REQUIRED_ARTIFACTS):
@@ -179,8 +236,8 @@ class S3BundleStorage:
 
         When ``object_versions`` is supplied directly, it must contain
         every expected object key and a valid version ID for each object.
-        This protects against mixing versions from different uploads, but
-        does not independently bind the contents to trusted metadata.
+        This protects against mixing versions from different bundle uploads,
+        but does not independently bind the contents to trusted metadata.
 
         If both arguments are omitted, current S3 object versions are read.
         That mode does not provide immutable-version or reference-digest
@@ -189,9 +246,11 @@ class S3BundleStorage:
         _, prefix = _validate_location(self._bucket, prefix)
         destination = Path(destination)
 
-        if destination.is_symlink() or (
-            destination.exists() and not destination.is_dir()
-        ):
+        # Check all existing path components, not only the final component.
+        # This prevents silently following a symlinked parent directory.
+        _reject_symlink_components(destination)
+
+        if destination.exists() and not destination.is_dir():
             raise ValueError("destination must be a regular directory path")
 
         expected = [
@@ -349,6 +408,10 @@ class S3BundleStorage:
         # can use a same-filesystem rename.
         destination.parent.mkdir(parents=True, exist_ok=True)
 
+        # Recheck after creating parents in case the path changed between
+        # the initial validation and directory creation.
+        _reject_symlink_components(destination)
+
         staging = Path(
             tempfile.mkdtemp(
                 prefix=f".{destination.name}.staging-",
@@ -357,6 +420,8 @@ class S3BundleStorage:
         )
 
         try:
+            _set_private_mode(staging, 0o700)
+
             for key, content, _version_id in downloaded:
                 if key.endswith("/manifest.json"):
                     relative = Path("manifest.json")
@@ -366,8 +431,12 @@ class S3BundleStorage:
                     relative = Path("artifacts") / key.rsplit("/", 1)[-1]
 
                 path = staging / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
+
+                if relative.parts[0] == "artifacts":
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    _set_private_mode(path.parent, 0o700)
+
+                _write_private_file(path, content)
 
             # Never overwrite an existing destination.
             if destination.exists() or destination.is_symlink():

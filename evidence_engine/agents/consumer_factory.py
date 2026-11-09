@@ -1,3 +1,4 @@
+
 """Application-level construction for configured consumer agents."""
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ def create_consumer(
     require_remote_bundle: bool = False,
     consumer_id: str | None = None,
     expected_stream_id: str | None = None,
+    bundle_root: Path | None = None,
     s3_client: Any | None = None,
     s3_client_factory: Callable[..., Any] | None = None,
 ) -> ConsumerAgent:
@@ -42,6 +44,13 @@ def create_consumer(
     requires both a trusted-key registry and an S3 storage adapter, either
     injected directly or constructed from configuration.
 
+    Set bundle_root to enable generation-aware local consumption. When
+    configured, the consumer resolves the bundle's CURRENT pointer and
+    requires local receipt paths to match the selected generation.
+    Invalid publication pointers fail closed without legacy fallback.
+
+    Remote S3 consumption remains independent of the local bundle_root.
+
     The DynamoDB client options (client/client_factory) are separate from
     the S3 client options (s3_client/s3_client_factory).
 
@@ -54,9 +63,17 @@ def create_consumer(
         raise TypeError("require_remote_bundle must be a boolean")
 
     if consumer_id is None:
-        consumer_id = settings.get("EVIDENCE_ENGINE_CONSUMER_ID", "").strip() or None
+        consumer_id = (
+            settings.get("EVIDENCE_ENGINE_CONSUMER_ID", "").strip() or None
+        )
+
     if expected_stream_id is None:
-        expected_stream_id = settings.get("EVIDENCE_ENGINE_EXPECTED_STREAM_ID", "").strip() or None
+        expected_stream_id = (
+            settings.get(
+                "EVIDENCE_ENGINE_EXPECTED_STREAM_ID", ""
+            ).strip()
+            or None
+        )
 
     if require_remote_bundle:
         if trust_registry_path is None:
@@ -114,4 +131,5 @@ def create_consumer(
         require_remote_bundle=require_remote_bundle,
         consumer_id=consumer_id,
         expected_stream_id=expected_stream_id,
+        bundle_root=bundle_root,
     )

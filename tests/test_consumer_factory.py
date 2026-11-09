@@ -1,3 +1,4 @@
+
 """Tests for configured consumer construction."""
 
 import pytest
@@ -31,6 +32,7 @@ def test_consumer_factory_constructs_memory_consumer(tmp_path):
     assert isinstance(consumer._acceptance_state, InMemoryAcceptanceState)
     assert consumer._expected_source == "local-claimed"
     assert consumer._expected_key_id == "test-key"
+    assert consumer._bundle_root is None
 
 
 def test_consumer_factory_constructs_dynamodb_consumer(tmp_path):
@@ -71,3 +73,24 @@ def test_consumer_factory_propagates_client_initialization_errors(tmp_path):
             },
             client_factory=broken_client_factory,
         )
+
+
+def test_consumer_factory_propagates_bundle_root(tmp_path):
+    """Explicit bundle_root must reach the constructed ConsumerAgent."""
+    bundle_root = tmp_path / "bundle"
+    artifacts_root = tmp_path / "artifacts"
+
+    consumer = create_consumer(
+        artifacts_root,
+        expected_source="local-claimed",
+        expected_key_id="test-key",
+        environ={BACKEND_ENV: "memory"},
+        bundle_root=bundle_root,
+    )
+
+    assert isinstance(consumer, ConsumerAgent)
+    assert isinstance(consumer._acceptance_state, InMemoryAcceptanceState)
+    assert consumer._root == artifacts_root
+    assert consumer._bundle_root == bundle_root
+    assert consumer._expected_source == "local-claimed"
+    assert consumer._expected_key_id == "test-key"

@@ -1,3 +1,4 @@
+"""Agent responsible for signing validated EvidenceEngine manifests."""
 
 from __future__ import annotations
 
@@ -6,6 +7,7 @@ from typing import Any, Literal
 
 from evidence_engine.agents.base import Agent, AgentResult
 from evidence_engine.canonical import canonical_json_bytes, parse_json_strict
+from evidence_engine.policy import PolicyEngine
 from evidence_engine.schema import validate_manifest
 from evidence_engine.signing import sign_bytes as local_sign_bytes, KEY_ID
 import evidence_engine.kms_signing as kms
@@ -24,31 +26,39 @@ class SigningAgent(Agent):
         aws_region: str = "us-east-1",
     ) -> None:
         super().__init__("signing-agent")
-        self._manifest_path = manifest_path
+        self._manifest_path = Path(manifest_path)
         self._mode = signing_mode
         self._private_key = private_key
         self._kms_key_id = kms_key_id
         self._aws_region = aws_region
+        self._policy_engine = PolicyEngine()
 
     def run(self, **kwargs: Any) -> AgentResult:
         try:
             manifest_bytes = self._manifest_path.read_bytes()
         except OSError as exc:
             return AgentResult(
-                False, None, "manifest-read-failed",
+                False,
+                None,
+                "manifest-read-failed",
                 {"exception": str(exc)},
             )
 
         # Preserve explicit configuration errors.
         if self._mode not in ("local", "kms"):
             return AgentResult(
-                False, None, "signing-mode-invalid",
+                False,
+                None,
+                "signing-mode-invalid",
                 {"mode": str(self._mode)},
             )
 
         if self._mode == "local" and self._private_key is None:
             return AgentResult(
-                False, None, "local-signing-missing-key", {},
+                False,
+                None,
+                "local-signing-missing-key",
+                {},
             )
 
         if self._mode == "kms" and (
@@ -56,7 +66,10 @@ class SigningAgent(Agent):
             or not self._kms_key_id.strip()
         ):
             return AgentResult(
-                False, None, "kms-signing-missing-key-id", {},
+                False,
+                None,
+                "kms-signing-missing-key-id",
+                {},
             )
 
         # Validate the exact bytes that will be signed.
@@ -64,37 +77,72 @@ class SigningAgent(Agent):
             manifest = parse_json_strict(manifest_bytes)
         except (ValueError, TypeError) as exc:
             return AgentResult(
-                False, None, "manifest-json-invalid",
+                False,
+                None,
+                "manifest-json-invalid",
                 {"exception": str(exc)},
             )
 
         try:
             if canonical_json_bytes(manifest) != manifest_bytes:
                 return AgentResult(
-                    False, None, "manifest-not-canonical", {},
+                    False,
+                    None,
+                    "manifest-not-canonical",
+                    {},
                 )
         except (ValueError, TypeError) as exc:
             return AgentResult(
-                False, None, "manifest-json-invalid",
+                False,
+                None,
+                "manifest-json-invalid",
                 {"exception": str(exc)},
             )
 
+        # First enforce manifest structure and schema.
         try:
             validate_manifest(manifest)
         except (ValueError, TypeError, KeyError) as exc:
             return AgentResult(
-                False, None, "manifest-schema-invalid",
+                False,
+                None,
+                "manifest-schema-invalid",
                 {"exception": str(exc)},
             )
 
+        # Then enforce the shared artifact representation policy.
+        try:
+            decision = self._policy_engine.evaluate_integrity(
+                manifest=manifest,
+            )
+        except Exception as exc:
+            return AgentResult(
+                False,
+                None,
+                "integrity-policy-evaluation-failed",
+                {"exception": str(exc)},
+            )
+
+        if not decision.allowed:
+            return AgentResult(
+                False,
+                None,
+                decision.reason,
+                {"details": dict(decision.details)},
+            )
+
+        # No signing operation occurs before both validation stages pass.
         if self._mode == "local":
             try:
                 signature = local_sign_bytes(
-                    self._private_key, manifest_bytes
+                    self._private_key,
+                    manifest_bytes,
                 )
             except Exception as exc:
                 return AgentResult(
-                    False, None, "local-signing-failed",
+                    False,
+                    None,
+                    "local-signing-failed",
                     {"exception": str(exc)},
                 )
 
@@ -104,11 +152,15 @@ class SigningAgent(Agent):
             try:
                 client = kms.create_kms_client(self._aws_region)
                 signature = kms.sign_bytes(
-                    client, self._kms_key_id, manifest_bytes
+                    client,
+                    self._kms_key_id,
+                    manifest_bytes,
                 )
             except Exception as exc:
                 return AgentResult(
-                    False, None, "kms-signing-failed",
+                    False,
+                    None,
+                    "kms-signing-failed",
                     {"exception": str(exc)},
                 )
 
@@ -116,7 +168,11 @@ class SigningAgent(Agent):
 
         return AgentResult(
             True,
-            {"signature": signature, "key_id": key_id, "mode": self._mode},
+            {
+                "signature": signature,
+                "key_id": key_id,
+                "mode": self._mode,
+            },
             None,
             {"mode": self._mode},
         )

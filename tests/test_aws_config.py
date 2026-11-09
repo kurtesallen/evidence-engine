@@ -1,3 +1,4 @@
+
 """Tests for explicit acceptance-state backend configuration."""
 
 import pytest
@@ -107,6 +108,44 @@ def test_dynamodb_uses_sdk_region_resolution_when_unset():
     )
 
     assert calls == [("dynamodb", {})]
+
+
+def test_default_dynamodb_client_uses_standard_retries_and_timeouts(
+    monkeypatch,
+):
+    import boto3
+
+    calls = []
+    fake_client = FakeDynamoDBClient()
+
+    def fake_boto3_client(service_name, **kwargs):
+        calls.append((service_name, kwargs))
+        return fake_client
+
+    monkeypatch.setattr(boto3, "client", fake_boto3_client)
+
+    state = create_acceptance_state(
+        environ={
+            BACKEND_ENV: "dynamodb",
+            TABLE_ENV: "evidence-acceptance",
+            "AWS_REGION": "us-east-1",
+        }
+    )
+
+    assert state._client is fake_client
+    assert len(calls) == 1
+
+    service_name, kwargs = calls[0]
+
+    assert service_name == "dynamodb"
+    assert kwargs["region_name"] == "us-east-1"
+
+    config = kwargs["config"]
+
+    assert config.retries["mode"] == "standard"
+    assert config.retries["total_max_attempts"] == 3
+    assert config.connect_timeout == 5
+    assert config.read_timeout == 15
 
 
 def test_invalid_table_configuration_does_not_create_client():

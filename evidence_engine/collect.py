@@ -5,6 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from evidence_engine.provenance import provider_lock_digest
+
 
 def git_value(root: Path, *args: str) -> str:
     try:
@@ -49,8 +51,11 @@ def collect(output: Path) -> None:
         encoding="utf-8",
     )
     (output / "commit.txt").write_text(
-        (git_value(Path.cwd(), "rev-parse", "HEAD") or
-         "UNCOMMITTED-LOCAL-EXERCISE") + "\n",
+        (
+            git_value(Path.cwd(), "rev-parse", "HEAD")
+            or "UNCOMMITTED-LOCAL-EXERCISE"
+        )
+        + "\n",
         encoding="utf-8",
     )
     (output / "version.txt").write_text(
@@ -61,19 +66,42 @@ def collect(output: Path) -> None:
     print(f"Sample evidence written to {output.resolve()}")
 
 
-def provenance_for(root: Path) -> dict:
+def provenance_for(
+    root: Path,
+    *,
+    terraform_root: Path | None = None,
+    require_provider_lock: bool = False,
+) -> dict:
+    """Capture repository claims and an optional Terraform provider lock digest.
+
+    When terraform_root is supplied, its .terraform.lock.hcl file is hashed.
+    Set require_provider_lock=True to fail if the Terraform root or lockfile
+    is missing.
+    """
+    if require_provider_lock and terraform_root is None:
+        raise ValueError(
+            "A Terraform root is required when the provider lockfile is mandatory"
+        )
+
     commit = git_value(root, "rev-parse", "HEAD")
 
     remote = git_value(root, "remote", "get-url", "origin")
     if remote.endswith(".git"):
         remote = remote[:-4]
 
+    lock_digest = ""
+    if terraform_root is not None:
+        lock_digest = provider_lock_digest(
+            terraform_root,
+            required=require_provider_lock,
+        )
+
     return {
         "repository": remote or "LOCAL-UNCONFIGURED",
         "commit_sha": commit or "UNCOMMITTED-LOCAL-EXERCISE",
         "workflow_run_id": "LOCAL",
         "terraform_version": "NOT-CAPTURED",
-        "provider_lock_sha256": "",
+        "provider_lock_sha256": lock_digest,
         "source": "local-claimed",
     }
 

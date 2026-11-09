@@ -1,4 +1,7 @@
+
 import hashlib
+import os
+import stat
 from io import BytesIO
 from pathlib import Path
 
@@ -79,12 +82,33 @@ def bundle(tmp_path):
     return artifacts, manifest, signature
 
 
+def make_storage(client=None):
+    """Create storage with the standard test bucket and KMS key."""
+    if client is None:
+        client = FakeS3()
+
+    return S3BundleStorage(
+        client,
+        "evidence-test-bucket",
+        "test-kms-key",
+    )
+
+
+def create_directory_symlink(linked_parent: Path, real_parent: Path):
+    """Create a directory symlink or skip when the platform disallows it."""
+    try:
+        linked_parent.symlink_to(
+            real_parent,
+            target_is_directory=True,
+        )
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+
 def test_upload_download_round_trip(bundle, tmp_path):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     uploaded = storage.upload_bundle(
         prefix="runs/test-123",
@@ -131,9 +155,8 @@ def test_upload_rejects_missing_required_artifact(tmp_path):
     signature = tmp_path / "manifest.sig"
     signature.write_bytes(b"sig")
 
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    client = FakeS3()
+    storage = make_storage(client)
 
     with pytest.raises(ValueError, match="Artifact set mismatch"):
         storage.upload_bundle(
@@ -143,13 +166,97 @@ def test_upload_rejects_missing_required_artifact(tmp_path):
             signature_path=signature,
         )
 
+    assert client.put_calls == []
+
+
+def test_upload_rejects_symlinked_artifact_parent(bundle, tmp_path):
+    artifacts, manifest, signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    linked_parent = tmp_path / "linked-artifact-parent"
+    create_directory_symlink(linked_parent, tmp_path)
+
+    linked_artifacts = linked_parent / artifacts.name
+
+    with pytest.raises(
+        ValueError,
+        match="Filesystem path cannot contain symlinks",
+    ):
+        storage.upload_bundle(
+            prefix="runs/symlinked-artifacts",
+            artifacts_root=linked_artifacts,
+            manifest_path=manifest,
+            signature_path=signature,
+        )
+
+    assert client.put_calls == []
+
+
+def test_upload_rejects_symlinked_manifest_parent(bundle, tmp_path):
+    artifacts, _manifest, signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    real_parent = tmp_path / "real-manifest-parent"
+    real_parent.mkdir()
+
+    real_manifest = real_parent / "manifest.json"
+    real_manifest.write_bytes(b'{"test":"manifest"}')
+
+    linked_parent = tmp_path / "linked-manifest-parent"
+    create_directory_symlink(linked_parent, real_parent)
+
+    linked_manifest = linked_parent / "manifest.json"
+
+    with pytest.raises(
+        ValueError,
+        match="Filesystem path cannot contain symlinks",
+    ):
+        storage.upload_bundle(
+            prefix="runs/symlinked-manifest",
+            artifacts_root=artifacts,
+            manifest_path=linked_manifest,
+            signature_path=signature,
+        )
+
+    assert client.put_calls == []
+
+
+def test_upload_rejects_symlinked_signature_parent(bundle, tmp_path):
+    artifacts, manifest, _signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    real_parent = tmp_path / "real-signature-parent"
+    real_parent.mkdir()
+
+    real_signature = real_parent / "manifest.sig"
+    real_signature.write_bytes(b"test-signature")
+
+    linked_parent = tmp_path / "linked-signature-parent"
+    create_directory_symlink(linked_parent, real_parent)
+
+    linked_signature = linked_parent / "manifest.sig"
+
+    with pytest.raises(
+        ValueError,
+        match="Filesystem path cannot contain symlinks",
+    ):
+        storage.upload_bundle(
+            prefix="runs/symlinked-signature",
+            artifacts_root=artifacts,
+            manifest_path=manifest,
+            signature_path=linked_signature,
+        )
+
+    assert client.put_calls == []
+
 
 def test_download_rejects_digest_metadata_mismatch(bundle, tmp_path):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     storage.upload_bundle(
         prefix="runs/test",
@@ -173,9 +280,7 @@ def test_download_rejects_digest_metadata_mismatch(bundle, tmp_path):
     ["", "../escape", "runs/../escape"],
 )
 def test_rejects_unsafe_prefix(prefix):
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     with pytest.raises(ValueError, match="prefix"):
         storage.download_bundle(
@@ -187,16 +292,16 @@ def test_rejects_unsafe_prefix(prefix):
 def test_requires_explicit_kms_key():
     with pytest.raises(ValueError, match="SSE-KMS key ID"):
         S3BundleStorage(
-            FakeS3(), "evidence-test-bucket", ""
+            FakeS3(),
+            "evidence-test-bucket",
+            "",
         )
 
 
 def test_metadata_digest_is_sha256(bundle):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     storage.upload_bundle(
         prefix="runs/test",
@@ -217,9 +322,7 @@ def test_metadata_digest_is_sha256(bundle):
 def test_download_uses_requested_object_versions(bundle, tmp_path):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     uploaded = storage.upload_bundle(
         prefix="runs/versioned",
@@ -266,9 +369,7 @@ def test_download_does_not_overwrite_existing_destination(
 ):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     storage.upload_bundle(
         prefix="runs/no-overwrite",
@@ -296,9 +397,7 @@ def test_download_does_not_overwrite_existing_destination(
 
 
 def test_download_rejects_unknown_version_key(bundle, tmp_path):
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     with pytest.raises(ValueError, match="unexpected object keys"):
         storage.download_bundle(
@@ -312,9 +411,7 @@ def test_download_rejects_unknown_version_key(bundle, tmp_path):
 
 def test_upload_returns_validated_bundle_reference(bundle):
     artifacts, manifest, signature = bundle
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     uploaded = storage.upload_bundle(
         prefix="runs/reference",
@@ -337,9 +434,7 @@ def test_upload_returns_validated_bundle_reference(bundle):
 def test_download_using_reference_retrieves_exact_versions(bundle, tmp_path):
     artifacts, manifest, signature = bundle
     client = FakeS3()
-    storage = S3BundleStorage(
-        client, "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage(client)
 
     uploaded = storage.upload_bundle(
         prefix="runs/reference-versioned",
@@ -375,9 +470,7 @@ def test_download_using_reference_retrieves_exact_versions(bundle, tmp_path):
 
 def test_download_reference_rejects_wrong_prefix(bundle, tmp_path):
     artifacts, manifest, signature = bundle
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     uploaded = storage.upload_bundle(
         prefix="runs/reference",
@@ -398,9 +491,7 @@ def test_download_reference_rejects_modified_digest(bundle, tmp_path):
     import copy
 
     artifacts, manifest, signature = bundle
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     uploaded = storage.upload_bundle(
         prefix="runs/reference-digest",
@@ -419,11 +510,10 @@ def test_download_reference_rejects_modified_digest(bundle, tmp_path):
             reference=reference,
         )
 
+
 def test_download_rejects_partial_object_versions(bundle, tmp_path):
     artifacts, manifest, signature = bundle
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     uploaded = storage.upload_bundle(
         prefix="runs/partial-versions",
@@ -454,9 +544,7 @@ def test_download_rejects_invalid_version_ids(
     bundle, tmp_path, invalid_version
 ):
     artifacts, manifest, signature = bundle
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     uploaded = storage.upload_bundle(
         prefix="runs/invalid-versions",
@@ -482,12 +570,113 @@ def test_download_rejects_invalid_version_ids(
 
 
 def test_download_rejects_repeated_separator_prefix(tmp_path):
-    storage = S3BundleStorage(
-        FakeS3(), "evidence-test-bucket", "test-kms-key"
-    )
+    storage = make_storage()
 
     with pytest.raises(ValueError, match="prefix"):
         storage.download_bundle(
             prefix="runs//unsafe",
             destination=tmp_path / "unsafe-download",
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes")
+def test_download_creates_private_files_and_directories(bundle, tmp_path):
+    artifacts, manifest, signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    storage.upload_bundle(
+        prefix="runs/private-download",
+        artifacts_root=artifacts,
+        manifest_path=manifest,
+        signature_path=signature,
+    )
+
+    destination = tmp_path / "private-download"
+
+    storage.download_bundle(
+        prefix="runs/private-download",
+        destination=destination,
+    )
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+    downloaded_artifacts = destination / "artifacts"
+    assert stat.S_IMODE(downloaded_artifacts.stat().st_mode) == 0o700
+
+    private_files = [
+        destination / "manifest.json",
+        destination / "manifest.sig",
+        *(
+            downloaded_artifacts / name
+            for name in REQUIRED_ARTIFACTS
+        ),
+    ]
+
+    for path in private_files:
+        assert path.is_file()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_download_rejects_symlinked_destination_parent(bundle, tmp_path):
+    artifacts, manifest, signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    storage.upload_bundle(
+        prefix="runs/symlink-parent",
+        artifacts_root=artifacts,
+        manifest_path=manifest,
+        signature_path=signature,
+    )
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+
+    linked_parent = tmp_path / "linked-parent"
+    create_directory_symlink(linked_parent, real_parent)
+
+    destination = linked_parent / "download"
+
+    with pytest.raises(ValueError, match="cannot contain symlinks"):
+        storage.download_bundle(
+            prefix="runs/symlink-parent",
+            destination=destination,
+        )
+
+    assert not (real_parent / "download").exists()
+    assert not list(real_parent.glob(".download.staging-*"))
+
+
+def test_download_cleans_staging_when_publication_fails(
+    bundle, tmp_path, monkeypatch
+):
+    artifacts, manifest, signature = bundle
+    client = FakeS3()
+    storage = make_storage(client)
+
+    storage.upload_bundle(
+        prefix="runs/failed-download",
+        artifacts_root=artifacts,
+        manifest_path=manifest,
+        signature_path=signature,
+    )
+
+    destination = tmp_path / "failed-download"
+    original_rename = Path.rename
+
+    def fail_staging_publication(path, target):
+        if path.name.startswith(".failed-download.staging-"):
+            raise OSError("simulated publication failure")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staging_publication)
+
+    with pytest.raises(OSError, match="simulated publication failure"):
+        storage.download_bundle(
+            prefix="runs/failed-download",
+            destination=destination,
+        )
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".failed-download.staging-*"))
