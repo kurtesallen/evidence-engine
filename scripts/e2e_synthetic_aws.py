@@ -21,6 +21,7 @@ from evidence_engine.aws.acceptance import DynamoDBAcceptanceState
 from evidence_engine.aws.config import create_acceptance_state
 from evidence_engine.aws.reference import BundleReference
 from evidence_engine.aws.storage_config import create_s3_bundle_storage
+from evidence_engine.bundle_publication import resolve_current_generation
 from evidence_engine.ci_provenance import capture_ci_context
 from evidence_engine.collect import provenance_for
 from evidence_engine.sanitization import TERRAFORM_JSON_CONTENT_RULE_VERSION
@@ -206,8 +207,11 @@ def produce() -> None:
                 f"Synthetic producer failed: {result.error}; audit={result.audit}"
             )
 
-        staged_plan = (output / "artifacts" / "plan.json").read_bytes()
-        staged_state = (output / "artifacts" / "state.json").read_bytes()
+        # Read the immutable generation selected by the atomic CURRENT pointer.
+        published = resolve_current_generation(output)
+
+        staged_plan = (published.artifacts_root / "plan.json").read_bytes()
+        staged_state = (published.artifacts_root / "state.json").read_bytes()
 
         for canary, payload in (
             (b"SYNTHETIC-PLAN-CANARY-SECRET", staged_plan),
