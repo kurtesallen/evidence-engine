@@ -145,13 +145,13 @@ def _run_terraform(
     """Run a controlled Terraform command without inherited CLI arguments."""
     environment = os.environ.copy()
 
-    # Prevent inherited variables from injecting additional Terraform
-    # arguments into the collector's explicitly constructed commands.
-    environment.pop("TF_CLI_ARGS", None)
-
-    subcommand = command[1] if len(command) > 1 else None
-    if subcommand:
-        environment.pop(f"TF_CLI_ARGS_{subcommand}", None)
+    # Remove inherited global and subcommand-specific Terraform CLI
+    # argument overrides while preserving unrelated environment settings.
+    environment = {
+        name: value
+        for name, value in environment.items()
+        if not name.upper().startswith("TF_CLI_ARGS")
+    }
 
     try:
         result = subprocess.run(
