@@ -187,14 +187,20 @@ def test_rejects_only_one_terraform_file_marked_sanitized(
         )
 
 
+@pytest.mark.parametrize("version", ["2.0", "2.1", "99.0"])
 def test_rejects_metadata_rule_version_mismatch(
     tmp_path: Path,
+    version: str,
 ):
+    """Production staging must reject non-production sanitizer versions."""
     source = tmp_path / "source"
     write_source(source)
 
     bad = metadata()
-    bad["plan.json"]["sanitization_rule_version"] = "99.0"
+    bad["plan.json"]["sanitization_rule_version"] = version
+    bad["state.json"]["sanitization_rule_version"] = version
+
+    destination = tmp_path / "bundle" / "artifacts"
 
     with pytest.raises(
         ArtifactSanitizationError,
@@ -202,9 +208,11 @@ def test_rejects_metadata_rule_version_mismatch(
     ):
         stage_sanitized_artifacts(
             source,
-            tmp_path / "bundle" / "artifacts",
+            destination,
             bad,
         )
+
+    assert not destination.exists()
 
 
 def test_rejects_invalid_terraform_json_before_creating_staging_directory(

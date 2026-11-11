@@ -294,7 +294,7 @@ def test_restricted_v2_excludes_arbitrary_resource_values():
     )
 
 
-@pytest.mark.parametrize("version", ["2.1", "3.0", "99.0"])
+@pytest.mark.parametrize("version", ["3.0", "99.0"])
 def test_rejects_unsupported_content_rule_versions(version):
     sanitizer = Sanitizer(
         rules=[

@@ -12,6 +12,7 @@ REDACTED = "[REDACTED]"
 TERRAFORM_JSON_CONTENT_RULE = "terraform_json_content"
 TERRAFORM_JSON_CONTENT_RULE_VERSION = "1.1"
 RESTRICTED_TERRAFORM_JSON_CONTENT_RULE_VERSION = "2.0"
+RESTRICTED_TERRAFORM_CHANGE_SUMMARY_RULE_VERSION = "2.1"
 
 
 class ArtifactSanitizationError(ValueError):
@@ -307,6 +308,115 @@ def _project_restricted_terraform_document(
     return projected
 
 
+
+_RESTRICTED_CHANGE_ACTIONS = {
+    ("create",): "creates",
+    ("update",): "updates",
+    ("delete",): "deletes",
+    ("delete", "create"): "replacements",
+    ("create", "delete"): "replacements",
+    ("read",): "reads",
+    ("no-op",): "no_ops",
+}
+
+
+def _summarize_restricted_resource_changes(
+    resource_changes: list[Any],
+) -> dict[str, Any]:
+    """Count resource_changes actions without exposing resource details."""
+    counts = {
+        "creates": 0,
+        "updates": 0,
+        "deletes": 0,
+        "replacements": 0,
+        "reads": 0,
+        "no_ops": 0,
+    }
+
+    for entry in resource_changes:
+        if not isinstance(entry, Mapping):
+            raise ArtifactSanitizationError(
+                "Invalid resource change entry: expected an object"
+            )
+
+        address = entry.get("address")
+        if not isinstance(address, str) or not address.strip():
+            raise ArtifactSanitizationError(
+                "Invalid resource change entry: missing address"
+            )
+
+        change = entry.get("change")
+        if not isinstance(change, Mapping):
+            raise ArtifactSanitizationError(
+                "Invalid resource change entry: missing change object"
+            )
+
+        actions = change.get("actions")
+        if not isinstance(actions, list):
+            raise ArtifactSanitizationError(
+                "Invalid resource change actions: expected an array"
+            )
+
+        if not all(isinstance(action, str) for action in actions):
+            raise ArtifactSanitizationError(
+                "Invalid resource change actions: expected strings"
+            )
+
+        category = _RESTRICTED_CHANGE_ACTIONS.get(tuple(actions))
+        if category is None:
+            raise ArtifactSanitizationError(
+                "Invalid resource change actions: unsupported action sequence"
+            )
+
+        counts[category] += 1
+
+    return {
+        "scope": "resource_changes",
+        **counts,
+        "total": sum(counts.values()),
+    }
+
+
+def _project_restricted_change_summary_document(
+    name: str,
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project experimental 2.1 resource-change counts only.
+
+    This does not attest to drift, output changes, plan application,
+    or the truthfulness of producer-supplied Terraform evidence.
+    """
+    terraform_version = document["terraform_version"]
+
+    if not re.fullmatch(
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
+        terraform_version,
+    ):
+        raise ArtifactSanitizationError(
+            "Restricted Terraform evidence requires a valid "
+            "terraform_version in major.minor.patch form"
+        )
+
+    projected: dict[str, Any] = {
+        "evidence_profile": "terraform-restricted-change-summary-2.1",
+        "format_version": document["format_version"],
+        "terraform_version": terraform_version,
+        "resource_details": "omitted",
+    }
+
+    if name == "plan.json":
+        projected["change_summary"] = _summarize_restricted_resource_changes(
+            document["resource_changes"]
+        )
+    elif name != "state.json":
+        raise ArtifactSanitizationError(
+            "Restricted change-summary projection only supports "
+            "plan.json and state.json"
+        )
+
+    return projected
+
+
 class Sanitizer:
     """Apply explicit, versioned metadata and Terraform content rules.
 
@@ -373,6 +483,7 @@ class Sanitizer:
         if rule_version not in {
             TERRAFORM_JSON_CONTENT_RULE_VERSION,
             RESTRICTED_TERRAFORM_JSON_CONTENT_RULE_VERSION,
+            RESTRICTED_TERRAFORM_CHANGE_SUMMARY_RULE_VERSION,
         }:
             raise ArtifactSanitizationError(
                 f"Unsupported Terraform content sanitization rule version: {rule_version}"
@@ -400,8 +511,14 @@ class Sanitizer:
         _validate_terraform_document(name, document)
         if rule_version == TERRAFORM_JSON_CONTENT_RULE_VERSION:
             sanitized_document = _sanitize_json_node(document)
+        elif rule_version == RESTRICTED_TERRAFORM_JSON_CONTENT_RULE_VERSION:
+            sanitized_document = _project_restricted_terraform_document(
+                name, document
+            )
         else:
-            sanitized_document = _project_restricted_terraform_document(name, document)
+            sanitized_document = _project_restricted_change_summary_document(
+                name, document
+            )
 
         if _contains_recognizable_secret(sanitized_document):
             raise ArtifactSanitizationError(

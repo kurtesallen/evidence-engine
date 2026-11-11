@@ -121,6 +121,44 @@ def test_real_signature_and_trusted_key_verify(signed_bundle):
     assert verify(signed_bundle) is True
 
 
+@pytest.mark.parametrize("version", ["2.0", "2.1", "99.0"])
+def test_validly_signed_bundle_rejects_unsupported_sanitization_version(
+    signed_bundle,
+    version,
+    capsys,
+):
+    """Reject experimental versions even with a valid signature."""
+    manifest_path = signed_bundle["manifest"]
+    signature_path = signed_bundle["signature"]
+
+    manifest = parse_json_strict(manifest_path.read_bytes())
+
+    for entry in manifest["artifacts"]:
+        if entry["name"] in {"plan.json", "state.json"}:
+            entry["representation"] = "sanitized"
+            entry["sanitization_rule_version"] = version
+
+    manifest_bytes = canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+
+    private_key_path = (
+        manifest_path.parent.parent / "keys" / "private.pem"
+    )
+
+    signature_path.write_bytes(
+        sign_bytes(private_key_path, manifest_bytes)
+    )
+
+    assert verify(signed_bundle) is False
+
+    output = capsys.readouterr().out
+
+    assert (
+        "unsupported sanitization rule version" in output
+        or "integrity-sanitization-rule-unsupported" in output
+    )
+
+
 def test_modified_artifact_is_rejected(signed_bundle):
     (signed_bundle["artifacts"] / "plan.json").write_bytes(
         b'{"tampered":true}\n'

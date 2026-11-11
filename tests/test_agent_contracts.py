@@ -165,6 +165,45 @@ def test_integrity_policy_allows_valid_manifest():
 
     assert decision.allowed is True
 
+@pytest.mark.parametrize("version", ["2.0", "2.1", "99.0"])
+def test_integrity_policy_rejects_unsupported_sanitization_version(
+    version,
+):
+    """Production integrity policy rejects experimental rule versions."""
+    manifest = {
+        "schema_version": "1.1",
+        "artifacts": [
+            {
+                "name": name,
+                "representation": (
+                    "sanitized"
+                    if name in {"plan.json", "state.json"}
+                    else "raw"
+                ),
+                "sanitization_rule_version": (
+                    version
+                    if name in {"plan.json", "state.json"}
+                    else None
+                ),
+            }
+            for name in (
+                "plan.json",
+                "state.json",
+                "commit.txt",
+                "version.txt",
+            )
+        ],
+    }
+
+    decision = PolicyEngine().evaluate_integrity(manifest=manifest)
+
+    assert decision.allowed is False
+    assert decision.reason == "integrity-sanitization-rule-unsupported"
+    assert decision.details["name"] == "plan.json"
+    assert decision.details["actual"] == version
+    assert decision.details["expected"] == "1.1"
+
+
 def test_consumption_policy_fail_closed_on_invalid_receipt():
     engine = PolicyEngine()
     decision = engine.evaluate_consumption(receipt=None)
