@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from evidence_engine.canonical import canonical_json_bytes
 from evidence_engine.sanitization import (
     ArtifactSanitizationError,
     SanitizationRule,
@@ -247,3 +248,311 @@ def test_rejects_plan_document_named_state_json():
 def test_rejects_state_document_named_plan_json():
     with pytest.raises(ArtifactSanitizationError, match="state-shaped"):
         sanitize("plan.json", state_document())
+
+
+def test_restricted_v2_excludes_arbitrary_resource_values():
+    """Restricted evidence must not publish arbitrary resource values."""
+    canary = "SYNTHETIC-CONFIDENTIAL-CANARY-987654"
+    document = state_document({
+        "root_module": {
+            "resources": [
+                {
+                    "address": "example.test",
+                    "mode": "managed",
+                    "type": "example_resource",
+                    "name": "test",
+                    "values": {
+                        "configuration_data": canary,
+                        "ordinary_name": "example",
+                    },
+                    "sensitive_values": {},
+                }
+            ]
+        }
+    })
+    restricted_sanitizer = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Restricted Terraform evidence projection",
+                version="2.0",
+            )
+        ]
+    )
+    result = restricted_sanitizer.sanitize_artifact_content(
+        "state.json",
+        json.dumps(document).encode("utf-8"),
+    )
+    projected = parse_result(result)
+    assert canary.encode("utf-8") not in result.content
+    assert projected["format_version"] == "1.0"
+    assert projected["terraform_version"] == "1.9.0"
+    assert projected["resource_details"] == "omitted"
+    assert "values" not in projected
+    assert result.applied_rules == (
+        "terraform_json_content@2.0",
+    )
+
+
+@pytest.mark.parametrize("version", ["2.1", "3.0", "99.0"])
+def test_rejects_unsupported_content_rule_versions(version):
+    sanitizer = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Unsupported content profile",
+                version=version,
+            )
+        ]
+    )
+    with pytest.raises(
+        ArtifactSanitizationError,
+        match="Unsupported Terraform content sanitization rule version",
+    ):
+        sanitizer.sanitize_artifact_content(
+            "state.json",
+            json.dumps(state_document()).encode("utf-8"),
+        )
+
+
+def test_restricted_v2_excludes_plan_resource_and_output_values():
+    canary = "SYNTHETIC-PLAN-CONFIDENTIAL-CANARY-123456"
+    document = plan_document()
+    document["planned_values"] = {
+        "root_module": {
+            "resources": [
+                {
+                    "address": "example.test",
+                    "values": {"configuration_data": canary},
+                }
+            ]
+        }
+    }
+    document["resource_changes"] = [
+        {
+            "address": "example.test",
+            "change": {
+                "actions": ["update"],
+                "before": {"configuration_data": canary},
+                "after": {"configuration_data": canary},
+            },
+        }
+    ]
+    document["output_changes"] = {
+        "confidential_output": {
+            "after": canary,
+        }
+    }
+    document["configuration"] = {
+        "provider_config": {
+            "example": {"expressions": {"data": canary}}
+        }
+    }
+    sanitizer = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Restricted Terraform evidence projection",
+                version="2.0",
+            )
+        ]
+    )
+    result = sanitizer.sanitize_artifact_content(
+        "plan.json",
+        json.dumps(document).encode("utf-8"),
+    )
+    projected = parse_result(result)
+    assert canary.encode("utf-8") not in result.content
+    assert projected == {
+        "evidence_profile": "terraform-restricted-2.0",
+        "format_version": "1.0",
+        "terraform_version": "1.9.0",
+        "resource_details": "omitted",
+        "change_details": "omitted",
+    }
+    assert result.applied_rules == ("terraform_json_content@2.0",)
+
+
+def test_restricted_v2_excludes_unknown_state_fields():
+    canary = "SYNTHETIC-UNKNOWN-FIELD-CANARY-123456"
+    document = state_document({
+        "root_module": {
+            "resources": [
+                {
+                    "address": "example.test",
+                    "values": {"arbitrary_field": canary},
+                }
+            ]
+        }
+    })
+    document["future_extension"] = {
+        "unexpected_data": canary,
+    }
+    sanitizer = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Restricted Terraform evidence projection",
+                version="2.0",
+            )
+        ]
+    )
+    result = sanitizer.sanitize_artifact_content(
+        "state.json",
+        json.dumps(document).encode("utf-8"),
+    )
+    assert canary.encode("utf-8") not in result.content
+    assert parse_result(result) == {
+        "evidence_profile": "terraform-restricted-2.0",
+        "format_version": "1.0",
+        "terraform_version": "1.9.0",
+        "resource_details": "omitted",
+    }
+
+
+def test_restricted_v2_canonical_output_is_deterministic():
+    rule = SanitizationRule(
+        name="terraform_json_content",
+        description="Restricted Terraform evidence projection",
+        version="2.0",
+    )
+    restricted = Sanitizer(rules=[rule])
+
+    first = state_document(
+        {"root_module": {"resources": []}},
+        future_extension={"arbitrary": "excluded"},
+    )
+    second = {
+        "future_extension": {"arbitrary": "excluded"},
+        "values": {"root_module": {"resources": []}},
+        "terraform_version": "1.9.0",
+        "format_version": "1.0",
+    }
+
+    first_result = restricted.sanitize_artifact_content(
+        "state.json", json.dumps(first).encode("utf-8")
+    )
+    second_result = restricted.sanitize_artifact_content(
+        "state.json", json.dumps(second).encode("utf-8")
+    )
+
+    assert first_result.content == second_result.content
+    assert first_result.content == canonical_json_bytes({
+        "evidence_profile": "terraform-restricted-2.0",
+        "format_version": "1.0",
+        "terraform_version": "1.9.0",
+        "resource_details": "omitted",
+    })
+
+
+def test_legacy_v1_1_preserves_expected_canonical_output():
+    document = state_document({
+        "root_module": {
+            "resources": [
+                {
+                    "values": {
+                        "password": "synthetic-secret",
+                        "ordinary_name": "preserved",
+                    },
+                    "sensitive_values": {},
+                }
+            ]
+        }
+    })
+
+    result = sanitize("state.json", document)
+    assert result.applied_rules == ("terraform_json_content@1.1",)
+
+    expected = {
+        "format_version": "1.0",
+        "terraform_version": "1.9.0",
+        "values": {
+            "root_module": {
+                "resources": [
+                    {
+                        "values": {
+                            "password": "[REDACTED]",
+                            "ordinary_name": "preserved",
+                        },
+                        "sensitive_values": {},
+                    }
+                ]
+            }
+        },
+    }
+
+
+    assert result.content == canonical_json_bytes(expected)
+
+
+def test_restricted_v2_rejects_untrusted_terraform_version():
+    document = {
+        "format_version": "1.0",
+        "terraform_version": "1.9.0-INTERNAL-CONFIDENTIAL-VALUE",
+        "values": {},
+    }
+
+    sanitizer = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Restricted Terraform evidence",
+                version="2.0",
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ArtifactSanitizationError,
+        match="terraform_version",
+    ):
+        sanitizer.sanitize_artifact_content(
+            "state.json",
+            json.dumps(document).encode("utf-8"),
+        )
+
+
+def test_restricted_v2_does_not_claim_zero_resource_changes():
+    """Omitted changes must never be represented as zero changes."""
+    document = plan_document()
+    document["resource_changes"] = [
+        {
+            "address": "example_resource.test",
+            "change": {
+                "actions": ["update"],
+                "before": {"configuration_data": "old-value"},
+                "after": {"configuration_data": "new-value"},
+            },
+        }
+    ]
+
+    restricted = Sanitizer(
+        rules=[
+            SanitizationRule(
+                name="terraform_json_content",
+                description="Restricted Terraform evidence projection",
+                version="2.0",
+            )
+        ]
+    )
+
+    result = restricted.sanitize_artifact_content(
+        "plan.json",
+        json.dumps(document).encode("utf-8"),
+    )
+
+    projected = parse_result(result)
+
+    assert projected == {
+        "evidence_profile": "terraform-restricted-2.0",
+        "format_version": "1.0",
+        "terraform_version": "1.9.0",
+        "resource_details": "omitted",
+        "change_details": "omitted",
+    }
+
+    assert "resource_changes" not in projected
+    assert "planned_values" not in projected
+    assert b"old-value" not in result.content
+    assert b"new-value" not in result.content
+    assert result.applied_rules == ("terraform_json_content@2.0",)

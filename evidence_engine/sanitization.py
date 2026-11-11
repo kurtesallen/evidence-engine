@@ -11,6 +11,7 @@ from evidence_engine.canonical import canonical_json_bytes
 REDACTED = "[REDACTED]"
 TERRAFORM_JSON_CONTENT_RULE = "terraform_json_content"
 TERRAFORM_JSON_CONTENT_RULE_VERSION = "1.1"
+RESTRICTED_TERRAFORM_JSON_CONTENT_RULE_VERSION = "2.0"
 
 
 class ArtifactSanitizationError(ValueError):
@@ -58,8 +59,8 @@ _SENSITIVE_KEY_MARKERS = (
 )
 
 # High-confidence patterns that must not remain under an innocuous-looking
-# key. This is not a complete detector for arbitrary secrets; the sanitizer
-# is intentionally scoped and will fail if one of these patterns remains.
+# key. This is not a complete detector for arbitrary secrets; the legacy
+# sanitizer is intentionally scoped.
 _RECOGNIZABLE_SECRET_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -103,9 +104,8 @@ def _validate_terraform_document(name: str, document: Mapping[str, Any]) -> None
     """Validate the outer envelope emitted by ``terraform show -json``.
 
     Terraform permits backward-compatible minor format additions, but callers
-    must reject an unsupported major version. We intentionally validate only a
-    small set of discriminating fields and leave unknown minor-version fields
-    untouched for forward compatibility.
+    must reject an unsupported major version. The legacy validator checks only
+    discriminating fields, leaving unknown minor-version fields untouched.
     """
     format_version = document.get("format_version")
     if not isinstance(format_version, str) or not re.fullmatch(
@@ -268,15 +268,51 @@ def _contains_recognizable_secret(node: Any) -> bool:
     return False
 
 
-class Sanitizer:
-    """Apply explicit, versioned metadata rules and Terraform JSON content rules.
+def _project_restricted_terraform_document(
+    name: str,
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only the minimal Terraform envelope; exclude all resource data.
 
-    Metadata sanitization preserves the legacy API. Content sanitization is a
-    separate operation that only accepts plan.json/state.json and requires an
-    explicit ``terraform_json_content`` rule. Unknown or ambiguous content fails
-    closed. The content rules redact sensitive-looking keys, honor Terraform's
-    explicit sensitive-value masks, and reject certain recognizable credentials
-    that remain. This is not a guarantee that all arbitrary secrets are found.
+    This experimental 2.0 profile does not attest to resources or changes and
+    must not be enabled for production publication without policy review.
+    """
+    terraform_version = document["terraform_version"]
+
+    # Restricted 2.0 publishes this value verbatim. Reject arbitrary
+    # text while preserving the legacy 1.1 validation behavior.
+    if not re.fullmatch(
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
+        terraform_version,
+    ):
+        raise ArtifactSanitizationError(
+            "Restricted Terraform evidence requires a valid "
+            "terraform_version in major.minor.patch form"
+        )
+
+    projected: dict[str, Any] = {
+        "evidence_profile": "terraform-restricted-2.0",
+        "format_version": document["format_version"],
+        "terraform_version": terraform_version,
+        "resource_details": "omitted",
+    }
+
+    if name == "plan.json":
+        projected["change_details"] = "omitted"
+    elif name != "state.json":
+        raise ArtifactSanitizationError(
+            "Restricted projection only supports plan.json and state.json"
+        )
+
+    return projected
+
+
+class Sanitizer:
+    """Apply explicit, versioned metadata and Terraform content rules.
+
+    The legacy 1.1 rule redacts sensitive-looking fields and known credential
+    patterns but cannot guarantee removal of arbitrary secrets. Experimental
+    2.0 projects only an allowlisted envelope.
     """
 
     def __init__(self, rules: Sequence[SanitizationRule] | None = None) -> None:
@@ -315,7 +351,7 @@ class Sanitizer:
         name: str,
         content: bytes,
     ) -> ArtifactSanitizationResult:
-        """Sanitize JSON content for plan.json/state.json without touching disk.
+        """Sanitize plan.json/state.json bytes without touching disk.
 
         The caller must write the returned bytes to a distinct output artifact
         and only then create a manifest hashing those exact bytes.
@@ -331,6 +367,15 @@ class Sanitizer:
         if len(rules) != 1 or not isinstance(rules[0].version, str) or not rules[0].version.strip():
             raise ArtifactSanitizationError(
                 "Exactly one versioned terraform_json_content rule is required"
+            )
+
+        rule_version = rules[0].version
+        if rule_version not in {
+            TERRAFORM_JSON_CONTENT_RULE_VERSION,
+            RESTRICTED_TERRAFORM_JSON_CONTENT_RULE_VERSION,
+        }:
+            raise ArtifactSanitizationError(
+                f"Unsupported Terraform content sanitization rule version: {rule_version}"
             )
 
         try:
@@ -353,7 +398,11 @@ class Sanitizer:
             )
 
         _validate_terraform_document(name, document)
-        sanitized_document = _sanitize_json_node(document)
+        if rule_version == TERRAFORM_JSON_CONTENT_RULE_VERSION:
+            sanitized_document = _sanitize_json_node(document)
+        else:
+            sanitized_document = _project_restricted_terraform_document(name, document)
+
         if _contains_recognizable_secret(sanitized_document):
             raise ArtifactSanitizationError(
                 "Recognizable credential pattern remains after sanitization"
@@ -368,5 +417,5 @@ class Sanitizer:
 
         return ArtifactSanitizationResult(
             content=sanitized_bytes,
-            applied_rules=(f"{TERRAFORM_JSON_CONTENT_RULE}@{rules[0].version}",),
+            applied_rules=(f"{TERRAFORM_JSON_CONTENT_RULE}@{rule_version}",),
         )
