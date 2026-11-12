@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -796,3 +797,71 @@ def test_remote_consumer_ignores_local_current_pointer(
     assert len(storage.calls) == 1
     assert len(verify_calls) == 1
     assert not bundle_root.exists()
+
+
+@pytest.mark.parametrize("version", ["2.0", "2.1"])
+def test_experimental_restricted_evidence_never_advances_acceptance(
+    consumer_setup,
+    monkeypatch,
+    version,
+):
+    """Unsupported restricted evidence must not update acceptance state."""
+    root, receipt, _ = consumer_setup
+
+    manifest_path = Path(receipt["manifest_path"])
+    manifest = json.loads(manifest_path.read_bytes())
+
+    for artifact in manifest["artifacts"]:
+        if artifact["name"] in {"plan.json", "state.json"}:
+            artifact["representation"] = "sanitized"
+            artifact["sanitization_rule_version"] = version
+
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    class RecordingAcceptanceState:
+        def __init__(self):
+            self.calls = []
+
+        def accept_once(self, bundle_digest):
+            self.calls.append(("accept_once", bundle_digest))
+            raise AssertionError("Rejected evidence reached accept_once")
+
+        def accept_ordered(self, bundle_digest, **kwargs):
+            self.calls.append(("accept_ordered", bundle_digest))
+            raise AssertionError("Rejected evidence reached accept_ordered")
+
+    state = RecordingAcceptanceState()
+
+    def production_policy_verify(*args):
+        from evidence_engine.canonical import parse_json_strict
+        from evidence_engine.policy import PolicyEngine
+        from evidence_engine.schema import validate_manifest
+
+        document = parse_json_strict(manifest_path.read_bytes())
+        validate_manifest(document)
+
+        decision = PolicyEngine().evaluate_integrity(document)
+
+        assert decision.allowed is False
+        assert decision.reason == "integrity-sanitization-rule-unsupported"
+        assert decision.details["actual"] == version
+
+        return False
+
+    # Override the fixture's always-successful verification mock.
+    monkeypatch.setattr(
+        "evidence_engine.agents.consumer.verify_bundle",
+        production_policy_verify,
+    )
+
+    consumer = make_consumer(
+        root,
+        expected_key_id="test-key",
+        acceptance_state=state,
+    )
+
+    result = consumer.run(receipt)
+
+    assert result.success is False
+    assert result.error == "verification-failed"
+    assert state.calls == []
