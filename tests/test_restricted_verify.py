@@ -1100,3 +1100,235 @@ def test_restricted_artifact_replacement_after_read_uses_original_bytes(
     assert result is True, (
         "Verifier should validate the original signed artifact bytes"
     )
+
+
+def test_restricted_artifact_truncation_during_read_rejects(
+    restricted_bundle,
+    monkeypatch,
+):
+    """Reject an artifact truncated after fstat but before reading."""
+    import os
+    import stat
+
+    import evidence_engine.restricted_verify as restricted_verify
+    import evidence_engine.trust as trust_module
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    artifacts = restricted_bundle["artifacts"]
+    plan_path = artifacts / "plan.json"
+
+    original_bytes = plan_path.read_bytes()
+    original_fstat = os.fstat
+    original_stat = os.stat
+
+    plan_metadata = original_stat(plan_path)
+
+    truncated = False
+
+    def truncating_fstat(descriptor):
+        nonlocal truncated
+
+        metadata = original_fstat(descriptor)
+
+        if (
+            not truncated
+            and stat.S_ISREG(metadata.st_mode)
+            and metadata.st_dev == plan_metadata.st_dev
+            and metadata.st_ino == plan_metadata.st_ino
+        ):
+            with open(plan_path, "r+b") as stream:
+                stream.truncate(0)
+
+            truncated = True
+
+        return metadata
+
+    monkeypatch.setattr(
+        restricted_verify.os,
+        "fstat",
+        truncating_fstat,
+    )
+
+    try:
+        result = verify(
+            restricted_bundle,
+            frozenset({restricted_bundle["profile"]}),
+        )
+    finally:
+        plan_path.write_bytes(original_bytes)
+
+    assert truncated, "Artifact truncation was not injected"
+    assert result is False
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_restricted_artifact_closes_descriptor(
+    restricted_bundle,
+    monkeypatch,
+    failure,
+):
+    """Artifact descriptors close after success or fdopen failure."""
+    import os
+
+    import evidence_engine.restricted_verify as restricted_verify
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    artifacts = restricted_bundle["artifacts"]
+    name = "plan.json"
+    expected = (artifacts / name).read_bytes()
+
+    original_open = os.open
+    original_fdopen = os.fdopen
+
+    opened_descriptors = []
+
+    # Preserve the verified capability before patching os.open.
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+
+        if (
+            path == name
+            and kwargs.get("dir_fd") is not None
+        ):
+            opened_descriptors.append(descriptor)
+
+        return descriptor
+
+    def injected_fdopen(descriptor, *args, **kwargs):
+        if failure and descriptor in opened_descriptors:
+            raise OSError("injected artifact fdopen failure")
+
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(restricted_verify.os, "open", tracked_open)
+        patch.setattr(restricted_verify.os, "fdopen", injected_fdopen)
+
+        directory_fd = restricted_verify._open_secure_restricted_directory(
+            artifacts
+        )
+
+        try:
+            if failure:
+                with pytest.raises(
+                    OSError,
+                    match="injected artifact fdopen failure",
+                ):
+                    restricted_verify._read_restricted_artifact(
+                        directory_fd,
+                        name,
+                        len(expected),
+                    )
+            else:
+                content = restricted_verify._read_restricted_artifact(
+                    directory_fd,
+                    name,
+                    len(expected),
+                )
+
+                assert content == expected
+
+            assert len(opened_descriptors) == 1
+
+            # The artifact descriptor must already be closed.
+            with pytest.raises(OSError):
+                os.fstat(opened_descriptors[0])
+
+            # The caller still owns the pinned directory descriptor.
+            os.fstat(directory_fd)
+
+        finally:
+            os.close(directory_fd)
+
+def test_restricted_artifact_closes_descriptor_on_read_failure(
+    restricted_bundle,
+    monkeypatch,
+):
+    """Close the artifact descriptor when stream.read raises OSError."""
+    import os
+
+    import evidence_engine.restricted_verify as restricted_verify
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    artifacts = restricted_bundle["artifacts"]
+    name = "plan.json"
+    expected_size = (artifacts / name).stat().st_size
+
+    original_fdopen = os.fdopen
+
+    class FailingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.stream.__exit__(
+                exc_type, exc_value, traceback
+            )
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            raise OSError("injected artifact read failure")
+
+    opened_descriptor = None
+
+    def failing_fdopen(descriptor, *args, **kwargs):
+        nonlocal opened_descriptor
+
+        opened_descriptor = descriptor
+        stream = original_fdopen(descriptor, *args, **kwargs)
+        return FailingStream(stream)
+
+    directory_fd = restricted_verify._open_secure_restricted_directory(
+        artifacts
+    )
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                restricted_verify.os,
+                "fdopen",
+                failing_fdopen,
+            )
+
+            with pytest.raises(
+                OSError,
+                match="injected artifact read failure",
+            ):
+                restricted_verify._read_restricted_artifact(
+                    directory_fd,
+                    name,
+                    expected_size,
+                )
+
+        assert opened_descriptor is not None
+
+        # The artifact descriptor must be closed after read failure.
+        with pytest.raises(OSError):
+            os.fstat(opened_descriptor)
+
+        # The caller's directory descriptor must remain valid.
+        os.fstat(directory_fd)
+
+    finally:
+        os.close(directory_fd)
