@@ -62,82 +62,147 @@ def _reject_symlink_components(path: Path, label: str) -> None:
             ) from exc
 
 
+def _supports_secure_restricted_traversal() -> bool:
+    """Require POSIX descriptor-relative directory and file operations."""
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+        and os.listdir in os.supports_fd
+    )
+
+
+def _open_secure_restricted_directory(path: Path) -> int:
+    """Open an absolute directory without following symlink components.
+
+    The returned descriptor belongs to the caller and must be closed.
+    """
+    if not _supports_secure_restricted_traversal():
+        raise ValueError("Secure restricted traversal is unavailable")
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+
+    if ".." in Path(path).parts:
+        raise ValueError("Restricted directory contains parent traversal")
+
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+    descriptors = []
+
+    try:
+        parts = absolute.parts
+
+        if not parts:
+            raise ValueError("Invalid restricted directory path")
+
+        current = os.open(parts[0], flags)
+        descriptors.append(current)
+
+        for part in parts[1:]:
+            current = os.open(
+                part,
+                flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+
+        result = descriptors.pop()
+        return result
+
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 def _read_restricted_metadata(
     path: Path,
     label: str,
     maximum: int,
 ) -> bytes:
-    """Read a regular metadata file with an explicit size limit."""
+    """Read bounded metadata through a securely opened parent directory."""
     if type(maximum) is not int or maximum < 0:
         raise ValueError(f"Invalid restricted {label} size limit")
 
-    _reject_symlink_components(path, f"Restricted {label}")
+    path = Path(path)
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if path.name in ("", ".", ".."):
+        raise ValueError(f"Invalid restricted {label} filename")
 
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
-    descriptor = os.open(path, flags)
+    directory_fd = _open_secure_restricted_directory(path.parent)
 
     try:
-        with os.fdopen(descriptor, "rb", buffering=0) as stream:
-            metadata = os.fstat(stream.fileno())
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
 
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(
-                    f"Restricted {label} is not a regular file"
-                )
+        descriptor = os.open(
+            path.name,
+            flags,
+            dir_fd=directory_fd,
+        )
 
-            if metadata.st_size > maximum:
-                raise ValueError(
-                    f"Restricted {label} exceeds size limit"
-                )
-
-            chunks = []
-            remaining = maximum + 1
-
-            while remaining > 0:
-                chunk = stream.read(remaining)
-
-                if not chunk:
-                    break
-
-                chunks.append(chunk)
-                remaining -= len(chunk)
-
-            content = b"".join(chunks)
-
-            if len(content) > maximum:
-                raise ValueError(
-                    f"Restricted {label} exceeds size limit"
-                )
-
-            return content
-
-    except BaseException:
-        # os.fdopen() normally transfers descriptor ownership to
-        # the stream. If it fails before ownership transfers,
-        # ensure the descriptor is not leaked.
         try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(descriptor, "rb", buffering=0) as stream:
+                metadata = os.fstat(stream.fileno())
+
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(
+                        f"Restricted {label} is not a regular file"
+                    )
+
+                if metadata.st_size > maximum:
+                    raise ValueError(
+                        f"Restricted {label} exceeds size limit"
+                    )
+
+                chunks = []
+                remaining = maximum + 1
+
+                while remaining > 0:
+                    chunk = stream.read(remaining)
+
+                    if not chunk:
+                        break
+
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+
+                content = b"".join(chunks)
+
+                if len(content) > maximum:
+                    raise ValueError(
+                        f"Restricted {label} exceeds size limit"
+                    )
+
+                return content
+
+        except BaseException:
+            # fdopen normally owns the descriptor. Also handle failure
+            # before ownership transfers.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+
+    finally:
+        os.close(directory_fd)
 
 
 def _read_restricted_artifact(
-    path: Path,
+    directory_fd: int,
     name: str,
     expected_size: int,
 ) -> bytes:
-    """Read one regular artifact with a strict size bound.
-
-    Reject excessive signed sizes before opening the artifact.
-    Validate the opened descriptor, then read at most the signed
-    size plus one byte to detect unexpected additional content.
-    """
+    """Read one bounded artifact relative to a pinned directory."""
     maximum = _RESTRICTED_ARTIFACT_LIMITS.get(name)
 
     if maximum is None:
@@ -152,44 +217,50 @@ def _read_restricted_artifact(
             f"Restricted artifact size exceeds policy: {name}"
         )
 
-    _reject_symlink_components(
-        path,
-        f"Restricted artifact {name}",
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
     )
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
 
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
 
-    descriptor = os.open(path, flags)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"Restricted artifact is not a regular file: {name}"
+                )
 
-    with os.fdopen(descriptor, "rb") as stream:
-        metadata = os.fstat(stream.fileno())
+            if metadata.st_size != expected_size:
+                raise ValueError(
+                    f"Restricted artifact size mismatch: {name}"
+                )
 
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(
-                f"Restricted artifact is not a regular file: {name}"
-            )
+            if metadata.st_size > maximum:
+                raise ValueError(
+                    f"Restricted artifact exceeds size limit: {name}"
+                )
 
-        if metadata.st_size != expected_size:
-            raise ValueError(
-                f"Restricted artifact size mismatch: {name}"
-            )
+            content = stream.read(expected_size + 1)
 
-        if metadata.st_size > maximum:
-            raise ValueError(
-                f"Restricted artifact exceeds size limit: {name}"
-            )
+            if len(content) != expected_size:
+                raise ValueError(
+                    f"Restricted artifact content size mismatch: {name}"
+                )
 
-        content = stream.read(expected_size + 1)
+            return content
 
-        if len(content) != expected_size:
-            raise ValueError(
-                f"Restricted artifact content size mismatch: {name}"
-            )
-
-        return content
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
 
 
 def verify_restricted_bundle(
@@ -286,15 +357,6 @@ def verify_restricted_bundle(
 
         artifacts = Path(artifacts)
 
-        _reject_symlink_components(
-            artifacts,
-            "Restricted artifacts",
-        )
-
-        if not artifacts.is_dir() or artifacts.is_symlink():
-            print("FAIL: restricted artifacts directory is invalid")
-            return False
-
         entries = {
             entry["name"]: entry
             for entry in manifest["artifacts"]
@@ -304,43 +366,38 @@ def verify_restricted_bundle(
             print("FAIL: restricted manifest artifact set mismatch")
             return False
 
-        # Reject unexpected files, directories, and direct symlinks.
-        actual_names = set()
+        # Enumeration and all artifact opens use one pinned directory.
+        directory_fd = _open_secure_restricted_directory(artifacts)
 
-        for path in artifacts.iterdir():
-            if path.is_symlink() or not path.is_file():
-                print("FAIL: invalid restricted artifact entry")
+        try:
+            actual_names = set(os.listdir(directory_fd))
+
+            if actual_names != set(entries):
+                print("FAIL: restricted artifact set differs from manifest")
                 return False
 
-            actual_names.add(path.name)
+            restricted_contents: dict[str, bytes] = {}
 
-        if actual_names != set(entries):
-            print("FAIL: restricted artifact set differs from manifest")
-            return False
-
-        # Read each artifact once. Authenticate the exact bytes before
-        # using them for restricted-document validation.
-        restricted_contents: dict[str, bytes] = {}
-
-        for name, entry in entries.items():
-            path = artifacts / name
-
-            content = _read_restricted_artifact(
-                path,
-                name,
-                entry["size_bytes"],
-            )
-
-            digest = hashlib.sha256(content).hexdigest()
-
-            if digest != entry["sha256"]:
-                print(
-                    f"FAIL: restricted artifact digest mismatch: {name}"
+            for name, entry in entries.items():
+                content = _read_restricted_artifact(
+                    directory_fd,
+                    name,
+                    entry["size_bytes"],
                 )
-                return False
 
-            if name in {"plan.json", "state.json"}:
-                restricted_contents[name] = content
+                digest = hashlib.sha256(content).hexdigest()
+
+                if digest != entry["sha256"]:
+                    print(
+                        f"FAIL: restricted artifact digest mismatch: {name}"
+                    )
+                    return False
+
+                if name in {"plan.json", "state.json"}:
+                    restricted_contents[name] = content
+
+        finally:
+            os.close(directory_fd)
 
         provenance_version = manifest["provenance"]["terraform_version"]
 
