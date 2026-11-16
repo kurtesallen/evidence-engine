@@ -1,8 +1,10 @@
 
-"""Strict validation rules for EvidenceEngine manifest v1.1, v1.2, and v1.3."""
+"""Strict validation rules for EvidenceEngine manifest v1.1 through v1.4."""
 
 import re
 from typing import Any
+
+from evidence_engine.restricted_contract import PROFILE_20, PROFILE_21
 
 REQUIRED_ARTIFACTS = {
     "plan.json",
@@ -15,7 +17,13 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 POSITIVE_INTEGER_RE = re.compile(r"^[1-9][0-9]*$")
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
-SUPPORTED_SCHEMA_VERSIONS = {"1.1", "1.2", "1.3"}
+SUPPORTED_SCHEMA_VERSIONS = {"1.1", "1.2", "1.3", "1.4"}
+
+RESTRICTED_PROFILE_RULES = {
+    PROFILE_20: "2.0",
+    PROFILE_21: "2.1",
+}
+
 
 TOP_LEVEL_FIELDS = {
     "schema_version",
@@ -25,6 +33,9 @@ TOP_LEVEL_FIELDS = {
     "provenance",
     "artifacts",
 }
+
+TOP_LEVEL_FIELDS_V1_4 = TOP_LEVEL_FIELDS | {"evidence_profile"}
+
 
 ARTIFACT_FIELDS = {
     "name",
@@ -62,18 +73,33 @@ def validate_manifest(value: Any) -> None:
     if not isinstance(value, dict):
         raise ValueError("Manifest must be a JSON object")
 
-    if set(value) != TOP_LEVEL_FIELDS:
-        raise ValueError(
-            "Manifest has missing or unknown top-level fields"
-        )
-
-    schema_version = value["schema_version"]
+    schema_version = value.get("schema_version")
 
     if (
         not isinstance(schema_version, str)
         or schema_version not in SUPPORTED_SCHEMA_VERSIONS
     ):
         raise ValueError("Unsupported manifest schema")
+
+    expected_top_level_fields = (
+        TOP_LEVEL_FIELDS_V1_4
+        if schema_version == "1.4"
+        else TOP_LEVEL_FIELDS
+    )
+
+    if set(value) != expected_top_level_fields:
+        raise ValueError(
+            "Manifest has missing or unknown top-level fields"
+        )
+
+    if schema_version == "1.4":
+        profile = value["evidence_profile"]
+
+        if (
+            not isinstance(profile, str)
+            or profile not in RESTRICTED_PROFILE_RULES
+        ):
+            raise ValueError("Unsupported restricted evidence profile")
 
     if value["hash_algorithm"] != "SHA-256":
         raise ValueError("Unsupported hash algorithm")
@@ -142,7 +168,7 @@ def validate_manifest(value: Any) -> None:
     # v1.2 adds ordered CI provenance; v1.3 also binds a stream ID.
     # These fields are claims; their presence does not independently
     # authenticate the workflow or runner.
-    if schema_version in {"1.2", "1.3"}:
+    if schema_version in {"1.2", "1.3", "1.4"}:
         if provenance["source"] != "github-actions-claimed":
             raise ValueError(
                 "Manifest v1.2 requires GitHub Actions provenance"
@@ -162,7 +188,7 @@ def validate_manifest(value: Any) -> None:
                     f"Invalid provenance field: {field}"
                 )
 
-    if schema_version == "1.3":
+    if schema_version in {"1.3", "1.4"}:
         stream_id = provenance["stream_id"]
         if not STREAM_ID_RE.fullmatch(stream_id):
             raise ValueError("Invalid provenance stream_id")
@@ -257,3 +283,33 @@ def validate_manifest(value: Any) -> None:
             f"Artifact set mismatch; missing={sorted(missing)}, "
             f"unexpected={sorted(unexpected)}"
         )
+
+    # Experimental v1.4 binds the restricted profile to both Terraform
+    # artifact metadata entries. This validates declarations only, not bytes.
+    if schema_version == "1.4":
+        expected_rule = RESTRICTED_PROFILE_RULES[value["evidence_profile"]]
+        entries = {entry["name"]: entry for entry in artifacts}
+
+        for name in ("plan.json", "state.json"):
+            entry = entries.get(name)
+
+            if entry["representation"] != "sanitized":
+                raise ValueError(
+                    f"Restricted Terraform artifact must be sanitized: {name}"
+                )
+
+            if entry["sanitization_rule_version"] != expected_rule:
+                raise ValueError(
+                    f"Restricted sanitization version mismatch: {name}"
+                )
+
+        for name in ("commit.txt", "version.txt"):
+            entry = entries.get(name)
+
+            if (
+                entry["representation"] not in {"raw", "sample"}
+                or entry["sanitization_rule_version"] is not None
+            ):
+                raise ValueError(
+                    f"Invalid restricted metadata artifact: {name}"
+                )
