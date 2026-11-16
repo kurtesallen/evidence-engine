@@ -1,6 +1,8 @@
 """Load and enforce the local EvidenceEngine trust registry."""
 
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -23,17 +25,14 @@ KEY_ENTRY_FIELDS = {
 }
 
 
-def load_trust_registry(registry_path: Path) -> dict[str, Any]:
-    """Load a trust registry and reject malformed structures."""
-    try:
-        registry = json.loads(
-            registry_path.read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Cannot load trust registry: {exc}"
-        ) from exc
+def _validate_trust_registry(
+    registry: Any,
+) -> dict[str, Any]:
+    """Validate an already-parsed trust registry.
 
+    This helper performs validation only. It does not read
+    files or resolve public-key paths.
+    """
     if not isinstance(registry, dict):
         raise ValueError("Trust registry must be a JSON object")
 
@@ -115,14 +114,99 @@ def load_trust_registry(registry_path: Path) -> dict[str, Any]:
     return registry
 
 
-def resolve_trusted_key(
-    registry_path: Path,
+def load_trust_registry(registry_path: Path) -> dict[str, Any]:
+    """Load a trust registry and reject malformed structures."""
+    try:
+        registry = json.loads(
+            registry_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot load trust registry: {exc}"
+        ) from exc
+
+    return _validate_trust_registry(registry)
+
+
+
+def _read_bounded_trust_file(
+    path: Path,
+    *,
+    label: str,
+    maximum: int,
+) -> bytes:
+    """Read a regular trust file with a strict byte limit."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError(f"Invalid {label} size limit")
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+
+    for component in (*reversed(absolute.parents), absolute):
+        try:
+            if component.is_symlink():
+                raise ValueError(
+                    f"{label} contains a symlink: {component}"
+                )
+        except OSError as exc:
+            raise ValueError(
+                f"Unable to inspect {label}: {component}"
+            ) from exc
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor = os.open(path, flags)
+
+    try:
+        with os.fdopen(descriptor, "rb", buffering=0) as stream:
+            metadata = os.fstat(stream.fileno())
+
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"{label} is not a regular file"
+                )
+
+            if metadata.st_size > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            chunks = []
+            remaining = maximum + 1
+
+            while remaining > 0:
+                chunk = stream.read(remaining)
+
+                if not chunk:
+                    break
+
+                chunks.append(chunk)
+                remaining -= len(chunk)
+
+            content = b"".join(chunks)
+
+            if len(content) > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            return content
+
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+def _authorize_trusted_key(
+    registry: dict[str, Any],
     key_id: str,
     source: str,
-) -> Path:
-    """Return a public key only if registry policy authorizes it."""
-    registry = load_trust_registry(registry_path)
-
+) -> dict[str, Any]:
+    """Select a unique, active key authorized for the given source."""
     matches = [
         entry
         for entry in registry["keys"]
@@ -142,11 +226,17 @@ def resolve_trusted_key(
             "Signing key is not authorized for this source"
         )
 
+    return entry
+
+
+def _resolve_trusted_key_path(
+    registry_path: Path,
+    entry: dict[str, Any],
+) -> Path:
+    """Resolve an authorized key path within the configured project."""
     registry_dir = registry_path.resolve().parent
     configured_key_path = Path(entry["public_key"])
 
-    # Recheck the path here so this function remains defensive
-    # if registry validation changes in the future.
     if configured_key_path.is_absolute():
         raise ValueError(
             "Trusted public key path must be relative"
@@ -156,8 +246,6 @@ def resolve_trusted_key(
         registry_dir / configured_key_path
     ).resolve()
 
-    # Keep resolved key files within the project directory
-    # containing the trust registry, including against symlink escapes.
     project_dir = registry_dir.parent.resolve()
 
     if not public_key_path.is_relative_to(project_dir):
@@ -169,6 +257,304 @@ def resolve_trusted_key(
         raise ValueError(
             "Trusted public key file does not exist"
         )
+
+    return public_key_path
+
+
+
+def _restricted_project_relative_key_path(
+    configured_path: str,
+) -> Path:
+    """Normalize a registry-relative key path within the project."""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    if (
+        PurePosixPath(configured_path).is_absolute()
+        or PureWindowsPath(configured_path).drive
+        or PureWindowsPath(configured_path).root
+        or "\\" in configured_path
+    ):
+        raise ValueError(
+            "Trusted public key path must be relative"
+        )
+
+    components = ["config"]
+
+    for part in PurePosixPath(configured_path).parts:
+        if part in ("", "."):
+            continue
+
+        if part == "..":
+            if not components:
+                raise ValueError(
+                    "Public key path escapes the configured project"
+                )
+            components.pop()
+            continue
+
+        components.append(part)
+
+    if not components:
+        raise ValueError("Trusted public key path is empty")
+
+    return Path(*components)
+
+
+def _supports_secure_trust_traversal() -> bool:
+    """Report availability of descriptor-relative POSIX traversal.
+
+    This checks platform capabilities only. It does not establish
+    that a particular filesystem path has been traversed securely.
+    """
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+    )
+
+
+def _read_secure_project_file(
+    project_root: Path,
+    relative_path: Path,
+    *,
+    label: str,
+    maximum: int,
+) -> bytes:
+    """Read a bounded regular file through POSIX directory descriptors."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError(f"Invalid {label} size limit")
+
+    project_root = Path(project_root)
+    relative_path = Path(relative_path)
+
+    if not project_root.is_absolute():
+        raise ValueError("Secure project root must be absolute")
+
+    if relative_path.is_absolute():
+        raise ValueError("Secure trust file path must be relative")
+
+    components = []
+
+    for part in relative_path.parts:
+        if part in ("", "."):
+            continue
+
+        if part == "..":
+            raise ValueError(
+                "Secure trust file path contains parent traversal"
+            )
+
+        components.append(part)
+
+    if not components:
+        raise ValueError("Secure trust file path is empty")
+
+    if not _supports_secure_trust_traversal():
+        raise ValueError("Secure trust traversal is unavailable")
+
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | close_on_exec
+    )
+
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_BINARY", 0)
+        | close_on_exec
+    )
+
+    descriptors = []
+
+    try:
+        root_parts = project_root.parts
+
+        if not root_parts:
+            raise ValueError("Invalid secure project root")
+
+        current = os.open(root_parts[0], directory_flags)
+        descriptors.append(current)
+
+        for part in root_parts[1:]:
+            current = os.open(
+                part,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+
+        for part in components[:-1]:
+            current = os.open(
+                part,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+
+        descriptor = os.open(
+            components[-1],
+            file_flags,
+            dir_fd=current,
+        )
+
+        try:
+            metadata = os.fstat(descriptor)
+
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"{label} is not a regular file"
+                )
+
+            if metadata.st_size > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            chunks = []
+            remaining = maximum + 1
+
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+
+                if not chunk:
+                    break
+
+                chunks.append(chunk)
+                remaining -= len(chunk)
+
+            content = b"".join(chunks)
+
+            if len(content) > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            return content
+
+        finally:
+            os.close(descriptor)
+
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+_RESTRICTED_TRUST_REGISTRY_LIMIT = 64 * 1024
+_RESTRICTED_TRUST_PUBLIC_KEY_LIMIT = 16 * 1024
+
+
+def load_bounded_trusted_key(
+    registry_path: Path,
+    key_id: str,
+    source: str,
+) -> bytes:
+    """Load an authorized RSA-2048 key through secure bounded reads.
+
+    This experimental API uses descriptor-relative POSIX traversal
+    for both the trust registry and its authorized public key.
+
+    Production trust resolution remains unchanged.
+    """
+    if not _supports_secure_trust_traversal():
+        raise ValueError(
+            "Secure trust traversal is unavailable"
+        )
+
+    # Normalize lexically, without following symlinks.
+    registry_path = Path(registry_path)
+
+    if ".." in registry_path.parts:
+        raise ValueError(
+            "Restricted trust registry contains parent traversal"
+        )
+
+    # Normalize only after rejecting parent traversal.
+    registry_path = Path(
+        os.path.abspath(os.fspath(registry_path))
+    )
+
+    registry_dir = registry_path.parent
+
+    if registry_dir.name != "config":
+        raise ValueError(
+            "Restricted trust registry must be inside config"
+        )
+
+    project_root = registry_dir.parent
+
+    registry_relative = Path("config") / registry_path.name
+
+    registry_bytes = _read_secure_project_file(
+        project_root,
+        registry_relative,
+        label="Restricted trust registry",
+        maximum=_RESTRICTED_TRUST_REGISTRY_LIMIT,
+    )
+
+    try:
+        registry = json.loads(registry_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Cannot load restricted trust registry"
+        ) from exc
+
+    registry = _validate_trust_registry(registry)
+
+    entry = _authorize_trusted_key(
+        registry,
+        key_id,
+        source,
+    )
+
+    key_relative = _restricted_project_relative_key_path(
+        entry["public_key"]
+    )
+
+    public_key_bytes = _read_secure_project_file(
+        project_root,
+        key_relative,
+        label="Restricted public key",
+        maximum=_RESTRICTED_TRUST_PUBLIC_KEY_LIMIT,
+    )
+
+    try:
+        key = serialization.load_pem_public_key(
+            public_key_bytes
+        )
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            "Trusted public key cannot be loaded"
+        ) from exc
+
+    if not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048:
+        raise ValueError("Trusted key must be RSA-2048")
+
+    return public_key_bytes
+
+
+def resolve_trusted_key(
+    registry_path: Path,
+    key_id: str,
+    source: str,
+) -> Path:
+    """Return a public key only if registry policy authorizes it."""
+    registry = load_trust_registry(registry_path)
+
+    entry = _authorize_trusted_key(
+        registry,
+        key_id,
+        source,
+    )
+
+    public_key_path = _resolve_trusted_key_path(
+        registry_path,
+        entry,
+    )
 
     try:
         key = serialization.load_pem_public_key(
