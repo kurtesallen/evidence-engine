@@ -68,6 +68,7 @@ def _supports_secure_restricted_traversal() -> bool:
         os.name == "posix"
         and hasattr(os, "O_NOFOLLOW")
         and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NONBLOCK")
         and os.open in os.supports_dir_fd
         and os.listdir in os.supports_fd
     )
@@ -119,6 +120,7 @@ def _open_secure_restricted_directory(path: Path) -> int:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
 
+
 def _read_restricted_metadata(
     path: Path,
     label: str,
@@ -141,6 +143,7 @@ def _read_restricted_metadata(
             | os.O_NOFOLLOW
             | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_CLOEXEC", 0)
+            | os.O_NONBLOCK
         )
 
         descriptor = os.open(
@@ -294,7 +297,6 @@ def verify_restricted_bundle(
 
         manifest_path = Path(manifest_path)
         signature_path = Path(signature_path)
-
 
         manifest_bytes = _read_restricted_metadata(
             manifest_path,

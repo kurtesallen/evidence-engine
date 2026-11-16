@@ -763,3 +763,340 @@ def test_restricted_artifact_parent_swap_does_not_follow_symlink(
     assert pinned_directory_verified, "Artifact open used a different directory"
     assert not followed_attacker_directory, "Artifact open followed swapped pathname"
     assert verified is True, "Pinned original bundle should still verify"
+
+
+@pytest.mark.parametrize("field", ["manifest", "signature"])
+def test_restricted_metadata_fifo_rejects_without_blocking(
+    restricted_bundle,
+    field,
+):
+    """Reject a metadata FIFO without waiting for a writer."""
+    import os
+    import subprocess
+    import sys
+
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFOs required")
+
+    path = restricted_bundle[field]
+    path.unlink()
+    os.mkfifo(path)
+
+    script = """
+import sys
+from pathlib import Path
+from evidence_engine.restricted_verify import verify_restricted_bundle
+
+root = Path(sys.argv[1])
+result = verify_restricted_bundle(
+    root / "artifacts",
+    root / "bundle" / "manifest.json",
+    root / "bundle" / "manifest.sig",
+    root / "config" / "trust_registry.json",
+    sys.argv[2],
+    allowed_profiles=frozenset({sys.argv[3]}),
+)
+sys.exit(0 if result is False else 1)
+"""
+
+    project = restricted_bundle["artifacts"].parent
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(project),
+                restricted_bundle["key_id"],
+                restricted_bundle["profile"],
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"Restricted verifier blocked opening FIFO metadata: {field}"
+        )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+
+@pytest.mark.parametrize("field", ["manifest", "signature"])
+def test_restricted_metadata_parent_swap_uses_pinned_directory(
+    restricted_bundle,
+    monkeypatch,
+    tmp_path,
+    field,
+):
+    """A metadata parent swap must not redirect descriptor-relative reads."""
+    import os
+
+    import evidence_engine.restricted_verify as restricted_verify
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    metadata_path = restricted_bundle[field]
+    metadata_directory = metadata_path.parent
+    original_directory = metadata_directory.with_name(
+        metadata_directory.name + "-original"
+    )
+
+    attacker_directory = tmp_path / "attacker-metadata"
+    attacker_directory.mkdir()
+
+    # Both files are present, but attacker-controlled and invalid.
+    (attacker_directory / "manifest.json").write_bytes(
+        b"attacker-controlled-manifest"
+    )
+    (attacker_directory / "manifest.sig").write_bytes(
+        b"attacker-controlled-signature"
+    )
+
+    original_identity = (
+        metadata_directory.stat().st_dev,
+        metadata_directory.stat().st_ino,
+    )
+    expected_content = metadata_path.read_bytes()
+
+    original_open = os.open
+    swapped = False
+    pinned_directory_verified = False
+    followed_attacker_directory = False
+
+    # Monkeypatching os.open changes membership checks in
+    # os.supports_dir_fd, so preserve the previously verified capability.
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        nonlocal pinned_directory_verified
+        nonlocal followed_attacker_directory
+
+        candidate = Path(path)
+        directory_fd = kwargs.get("dir_fd")
+
+        if candidate == Path(metadata_path.name) and directory_fd is not None:
+            if not swapped:
+                metadata_directory.rename(original_directory)
+                metadata_directory.symlink_to(
+                    attacker_directory,
+                    target_is_directory=True,
+                )
+                swapped = True
+
+            opened_directory = os.fstat(directory_fd)
+            pinned_directory_verified = (
+                opened_directory.st_dev,
+                opened_directory.st_ino,
+            ) == original_identity
+
+        if (
+            swapped
+            and candidate == metadata_path
+            and directory_fd is None
+        ):
+            followed_attacker_directory = True
+
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(restricted_verify.os, "open", tracked_open)
+
+    try:
+        actual_content = restricted_verify._read_restricted_metadata(
+            metadata_path,
+            field,
+            restricted_verify._RESTRICTED_METADATA_LIMITS[field],
+        )
+    finally:
+        if metadata_directory.is_symlink():
+            metadata_directory.unlink()
+
+        if original_directory.exists():
+            original_directory.rename(metadata_directory)
+
+    assert swapped, "Metadata race injection did not execute"
+    assert pinned_directory_verified, (
+        "Metadata open did not use the original pinned directory"
+    )
+    assert not followed_attacker_directory, (
+        "Metadata open followed the swapped pathname"
+    )
+    assert actual_content == expected_content, (
+        "Metadata content changed after parent-directory replacement"
+    )
+
+
+@pytest.mark.parametrize("field", ["manifest", "signature"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_restricted_metadata_closes_descriptors(
+    restricted_bundle,
+    monkeypatch,
+    field,
+    failure,
+):
+    """Metadata reads close their file and parent descriptors."""
+    import os
+
+    import evidence_engine.restricted_verify as restricted_verify
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    path = restricted_bundle[field]
+    expected = path.read_bytes()
+
+    original_open = os.open
+    original_fdopen = os.fdopen
+    opened_descriptors = []
+
+    # Patching os.open changes os.supports_dir_fd membership checks.
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
+
+    def tracked_open(path_arg, flags, *args, **kwargs):
+        descriptor = original_open(
+            path_arg,
+            flags,
+            *args,
+            **kwargs,
+        )
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def tracked_fdopen(descriptor, *args, **kwargs):
+        if failure:
+            raise OSError("injected fdopen failure")
+
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(restricted_verify.os, "open", tracked_open)
+
+    if failure:
+        monkeypatch.setattr(
+            restricted_verify.os,
+            "fdopen",
+            tracked_fdopen,
+        )
+
+    try:
+        if failure:
+            with pytest.raises(
+                OSError,
+                match="injected fdopen failure",
+            ):
+                restricted_verify._read_restricted_metadata(
+                    path,
+                    field,
+                    restricted_verify._RESTRICTED_METADATA_LIMITS[field],
+                )
+        else:
+            content = restricted_verify._read_restricted_metadata(
+                path,
+                field,
+                restricted_verify._RESTRICTED_METADATA_LIMITS[field],
+            )
+            assert content == expected
+
+        assert opened_descriptors
+
+        for descriptor in opened_descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        monkeypatch.undo()
+
+
+def test_restricted_verifier_fails_closed_without_secure_traversal(
+    restricted_bundle,
+    monkeypatch,
+):
+    """Restricted verification rejects unavailable secure traversal."""
+    import evidence_engine.restricted_verify as restricted_verify
+
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: False,
+    )
+
+    assert verify(
+        restricted_bundle,
+        frozenset({restricted_bundle["profile"]}),
+    ) is False
+
+
+def test_restricted_artifact_replacement_after_read_uses_original_bytes(
+    restricted_bundle,
+    monkeypatch,
+):
+    """Replacing an artifact after its read cannot change validated bytes."""
+    import os
+
+    import evidence_engine.restricted_verify as restricted_verify
+
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    artifacts = restricted_bundle["artifacts"]
+    plan_path = artifacts / "plan.json"
+
+    original_bytes = plan_path.read_bytes()
+    replacement_bytes = b"attacker-controlled-plan"
+
+    original_reader = restricted_verify._read_restricted_artifact
+
+    replaced = False
+
+    def replacing_reader(directory_fd, name, expected_size):
+        nonlocal replaced
+
+        content = original_reader(
+            directory_fd,
+            name,
+            expected_size,
+        )
+
+        if name == "plan.json" and not replaced:
+            replacement_path = artifacts / "plan-replacement.tmp"
+
+            replacement_path.write_bytes(replacement_bytes)
+            os.replace(replacement_path, plan_path)
+
+            replaced = True
+
+        return content
+
+    monkeypatch.setattr(
+        restricted_verify,
+        "_read_restricted_artifact",
+        replacing_reader,
+    )
+
+    try:
+        result = verify(
+            restricted_bundle,
+            frozenset({restricted_bundle["profile"]}),
+        )
+    finally:
+        plan_path.write_bytes(original_bytes)
+
+    assert replaced, "Artifact replacement was not injected"
+    assert result is True, (
+        "Verifier should validate the original signed artifact bytes"
+    )
