@@ -8,10 +8,7 @@ from evidence_engine.restricted_contract import PROFILE_20, PROFILE_21
 from evidence_engine.restricted_verify import verify_restricted_bundle
 from evidence_engine.signing import KEY_ID, generate_key_pair, sign_bytes
 from evidence_engine.verify import verify_bundle
-
-
 PROFILES = (PROFILE_20, PROFILE_21)
-
 
 def restricted_document(name, profile, terraform_version="1.9.0"):
     document = {
@@ -36,8 +33,8 @@ def restricted_document(name, profile, terraform_version="1.9.0"):
             }
     return document
 
-
 @pytest.fixture(params=PROFILES)
+
 def restricted_bundle(tmp_path, request):
     profile = request.param
     project = tmp_path / "project"
@@ -123,7 +120,6 @@ def restricted_bundle(tmp_path, request):
         "key_id": KEY_ID,
     }
 
-
 def verify(bundle, allowed_profiles):
     return verify_restricted_bundle(
         bundle["artifacts"],
@@ -134,14 +130,12 @@ def verify(bundle, allowed_profiles):
         allowed_profiles=allowed_profiles,
     )
 
-
 def resign(bundle, manifest):
     content = canonical_json_bytes(manifest)
     bundle["manifest"].write_bytes(content)
     bundle["signature"].write_bytes(
         sign_bytes(bundle["private_key"], content)
     )
-
 
 def update_artifact_and_resign(bundle, name, content):
     (bundle["artifacts"] / name).write_bytes(content)
@@ -152,17 +146,14 @@ def update_artifact_and_resign(bundle, name, content):
             entry["sha256"] = hashlib.sha256(content).hexdigest()
     resign(bundle, manifest)
 
-
 def test_authorized_signed_restricted_bundle_verifies(restricted_bundle):
     assert verify(
         restricted_bundle,
         frozenset({restricted_bundle["profile"]}),
     ) is True
 
-
 def test_empty_authorization_rejects(restricted_bundle):
     assert verify(restricted_bundle, frozenset()) is False
-
 
 def test_other_profile_authorization_rejects(restricted_bundle):
     other = (
@@ -172,10 +163,8 @@ def test_other_profile_authorization_rejects(restricted_bundle):
     )
     assert verify(restricted_bundle, frozenset({other})) is False
 
-
 def test_invalid_authorization_type_rejects(restricted_bundle):
     assert verify(restricted_bundle, "all") is False
-
 
 def test_invalid_signature_rejects(restricted_bundle):
     restricted_bundle["signature"].write_bytes(b"invalid-signature")
@@ -184,8 +173,8 @@ def test_invalid_signature_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 @pytest.mark.parametrize("status", ["revoked", "retired"])
+
 def test_inactive_signing_key_rejects(restricted_bundle, status):
     path = restricted_bundle["trust_registry"]
     registry = json.loads(path.read_text(encoding="utf-8"))
@@ -195,7 +184,6 @@ def test_inactive_signing_key_rejects(restricted_bundle, status):
         restricted_bundle,
         frozenset({restricted_bundle["profile"]}),
     ) is False
-
 
 def test_unauthorized_signing_source_rejects(restricted_bundle):
     path = restricted_bundle["trust_registry"]
@@ -207,7 +195,6 @@ def test_unauthorized_signing_source_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 def test_modified_artifact_rejects(restricted_bundle):
     (restricted_bundle["artifacts"] / "plan.json").write_bytes(
         b"tampered"
@@ -217,7 +204,6 @@ def test_modified_artifact_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 def test_unexpected_artifact_rejects(restricted_bundle):
     (restricted_bundle["artifacts"] / "unexpected.txt").write_bytes(
         b"extra"
@@ -226,7 +212,6 @@ def test_unexpected_artifact_rejects(restricted_bundle):
         restricted_bundle,
         frozenset({restricted_bundle["profile"]}),
     ) is False
-
 
 def test_signed_mismatched_document_profile_rejects(restricted_bundle):
     other = (
@@ -245,7 +230,6 @@ def test_signed_mismatched_document_profile_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 def test_signed_noncanonical_document_rejects(restricted_bundle):
     document = restricted_document(
         "state.json",
@@ -262,7 +246,6 @@ def test_signed_noncanonical_document_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 def test_signed_terraform_version_mismatch_rejects(restricted_bundle):
     document = restricted_document(
         "state.json",
@@ -278,7 +261,6 @@ def test_signed_terraform_version_mismatch_rejects(restricted_bundle):
         restricted_bundle,
         frozenset({restricted_bundle["profile"]}),
     ) is False
-
 
 def test_signed_invalid_restricted_content_rejects(restricted_bundle):
     document = restricted_document(
@@ -298,7 +280,6 @@ def test_signed_invalid_restricted_content_rejects(restricted_bundle):
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 def test_production_verifier_still_rejects_v14(restricted_bundle):
     assert verify_bundle(
         restricted_bundle["artifacts"],
@@ -308,13 +289,21 @@ def test_production_verifier_still_rejects_v14(restricted_bundle):
         restricted_bundle["key_id"],
     ) is False
 
-
 def test_restricted_artifacts_are_read_once(
     restricted_bundle,
     monkeypatch,
 ):
+
     """Open each artifact once for hashing and restricted validation."""
     import evidence_engine.restricted_verify as restricted_verify
+    # Preserve established POSIX capability while os.open is patched.
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
     import evidence_engine.trust as trust_module
     if not trust_module._supports_secure_trust_traversal():
         pytest.skip("Secure POSIX trust traversal unavailable")
@@ -335,7 +324,11 @@ def test_restricted_artifacts_are_read_once(
     }
     def tracked_open(path, flags, *args, **kwargs):
         candidate = Path(path)
-        if candidate.parent == artifacts and candidate.name in opens:
+        if (
+            candidate == Path(candidate.name)
+            and candidate.name in opens
+            and kwargs.get("dir_fd") is not None
+        ):
             opens[candidate.name] += 1
         return original_open(path, flags, *args, **kwargs)
     monkeypatch.setattr(
@@ -354,11 +347,11 @@ def test_restricted_artifacts_are_read_once(
         "version.txt": 1,
     }
 
-
 def test_symlinked_artifact_ancestor_rejects(
     restricted_bundle,
     tmp_path,
 ):
+
     """Do not follow a symlink in the artifact directory ancestry."""
     actual_parent = restricted_bundle["artifacts"].parent
     linked_parent = tmp_path / "linked-project"
@@ -383,28 +376,22 @@ def test_symlinked_artifact_ancestor_rejects(
         }),
     ) is False
 
-
 def test_restricted_verifier_rejects_symlinked_ancestor(
     restricted_bundle,
-    monkeypatch,
+    tmp_path,
 ):
-    """Reject an artifact path whose ancestry fails symlink validation."""
-    import evidence_engine.restricted_verify as restricted_verify
-    def reject_artifact_ancestry(path, label):
-        if path == restricted_bundle["artifacts"]:
-            raise ValueError(
-                "Restricted artifacts contains a symlink"
-            )
-    monkeypatch.setattr(
-        restricted_verify,
-        "_reject_symlink_components",
-        reject_artifact_ancestry,
-    )
+    """Reject a symlink used as the artifact directory itself."""
+    artifacts = restricted_bundle["artifacts"]
+    linked_artifacts = tmp_path / "linked-artifacts"
+    try:
+        linked_artifacts.symlink_to(artifacts, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Directory symlinks unavailable on this platform")
+    restricted_bundle["artifacts"] = linked_artifacts
     assert verify(
         restricted_bundle,
         frozenset({restricted_bundle["profile"]}),
     ) is False
-
 
 @pytest.mark.parametrize(
     "name,maximum",
@@ -416,12 +403,12 @@ def test_restricted_verifier_rejects_symlinked_ancestor(
     ],
 )
 
-
 def test_oversized_signed_artifact_rejects(
     restricted_bundle,
     name,
     maximum,
 ):
+
     """Reject oversized content even when its signed digest matches."""
     content = b"x" * (maximum + 1)
     update_artifact_and_resign(
@@ -434,7 +421,6 @@ def test_oversized_signed_artifact_rejects(
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 @pytest.mark.parametrize(
     "name,maximum",
     [
@@ -445,12 +431,12 @@ def test_oversized_signed_artifact_rejects(
     ],
 )
 
-
 def test_oversized_declared_artifact_rejects(
     restricted_bundle,
     name,
     maximum,
 ):
+
     """Reject excessive signed artifact sizes."""
     manifest = json.loads(
         restricted_bundle["manifest"].read_bytes()
@@ -464,7 +450,6 @@ def test_oversized_declared_artifact_rejects(
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 @pytest.mark.parametrize(
     "name,maximum",
     [
@@ -475,15 +460,26 @@ def test_oversized_declared_artifact_rejects(
     ],
 )
 
-
 def test_oversized_declaration_rejected_before_artifact_read(
     restricted_bundle,
     monkeypatch,
     name,
     maximum,
 ):
+
     """Reject oversized signed declarations before opening artifacts."""
     import evidence_engine.restricted_verify as restricted_verify
+    import evidence_engine.trust as trust_module
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+    monkeypatch.setattr(
+        restricted_verify, "_supports_secure_restricted_traversal", lambda: True
+    )
+    monkeypatch.setattr(
+        trust_module, "_supports_secure_trust_traversal", lambda: True
+    )
     manifest = json.loads(
         restricted_bundle["manifest"].read_bytes()
     )
@@ -491,12 +487,11 @@ def test_oversized_declaration_rejected_before_artifact_read(
         if entry["name"] == name:
             entry["size_bytes"] = maximum + 1
     resign(restricted_bundle, manifest)
-    artifact_path = restricted_bundle["artifacts"] / name
     original_open = restricted_verify.os.open
     opens = []
     def tracked_open(path, flags, *args, **kwargs):
-        if Path(path) == artifact_path:
-            opens.append(Path(path))
+        if Path(path) == Path(name) and kwargs.get("dir_fd") is not None:
+            opens.append(name)
         return original_open(path, flags, *args, **kwargs)
     monkeypatch.setattr(
         restricted_verify.os,
@@ -509,14 +504,22 @@ def test_oversized_declaration_rejected_before_artifact_read(
     ) is False
     assert opens == []
 
-
 def test_restricted_artifact_rejects_nonregular_open_descriptor(
     restricted_bundle,
     monkeypatch,
     tmp_path,
 ):
+
     """Reject a non-regular descriptor despite a valid artifact path."""
     import evidence_engine.restricted_verify as restricted_verify
+    # Preserve established POSIX capability while os.open is patched.
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
     import evidence_engine.trust as trust_module
     if not trust_module._supports_secure_trust_traversal():
         pytest.skip("Secure POSIX trust traversal unavailable")
@@ -533,14 +536,9 @@ def test_restricted_artifact_rejects_nonregular_open_descriptor(
     original_open = restricted_verify.os.open
     substituted = []
     def substituted_open(path, flags, *args, **kwargs):
-        if Path(path) == artifact_path:
-            substituted.append(Path(path))
-            return original_open(
-                directory_path,
-                flags,
-                *args,
-                **kwargs,
-            )
+        if Path(path) == Path("plan.json") and kwargs.get("dir_fd") is not None:
+            substituted.append(artifact_path)
+            return original_open(directory_path, restricted_verify.os.O_RDONLY | restricted_verify.os.O_DIRECTORY)
         return original_open(path, flags, *args, **kwargs)
     monkeypatch.setattr(
         restricted_verify.os,
@@ -553,7 +551,6 @@ def test_restricted_artifact_rejects_nonregular_open_descriptor(
     ) is False
     assert substituted == [artifact_path]
 
-
 @pytest.mark.parametrize(
     "field,maximum",
     [
@@ -562,12 +559,12 @@ def test_restricted_artifact_rejects_nonregular_open_descriptor(
     ],
 )
 
-
 def test_oversized_restricted_metadata_rejects(
     restricted_bundle,
     field,
     maximum,
 ):
+
     """Reject metadata larger than the configured size limit."""
     path = restricted_bundle[field]
     path.write_bytes(b"x" * (maximum + 1))
@@ -576,7 +573,6 @@ def test_oversized_restricted_metadata_rejects(
         frozenset({restricted_bundle["profile"]}),
     ) is False
 
-
 @pytest.mark.parametrize(
     "field,maximum",
     [
@@ -585,15 +581,23 @@ def test_oversized_restricted_metadata_rejects(
     ],
 )
 
-
 def test_oversized_metadata_rejected_before_read(
     restricted_bundle,
     monkeypatch,
     field,
     maximum,
 ):
+
     """Reject oversized metadata before reading the target file."""
     import evidence_engine.restricted_verify as restricted_verify
+    # Preserve established POSIX capability while os.open is patched.
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+    monkeypatch.setattr(
+        restricted_verify,
+        "_supports_secure_restricted_traversal",
+        lambda: True,
+    )
     path = restricted_bundle[field]
     path.write_bytes(b"x" * (maximum + 1))
     original_open = restricted_verify.os.open
@@ -607,7 +611,10 @@ def test_oversized_metadata_rejected_before_read(
             *args,
             **kwargs,
         )
-        if Path(candidate) == path:
+        if (
+                Path(candidate).name == path.name
+                and kwargs.get("dir_fd") is not None
+            ):
             target_descriptors.add(descriptor)
         return descriptor
     class TrackedStream:
@@ -649,11 +656,11 @@ def test_oversized_metadata_rejected_before_read(
     assert target_descriptors
     assert target_reads == []
 
-
 def test_restricted_verifier_reads_trusted_key_once(
     restricted_bundle,
     monkeypatch,
 ):
+
     import evidence_engine.trust as trust_module
     if not trust_module._supports_secure_trust_traversal():
         pytest.skip("Secure POSIX trust traversal unavailable")
@@ -690,3 +697,69 @@ def test_restricted_verifier_reads_trusted_key_once(
     assert key_reads[0][2] == 16 * 1024
     assert registry_reads[0][0] == Path("config/trust_registry.json")
     assert key_reads[0][0] == Path("keys/public.pem")
+
+def test_restricted_artifact_parent_swap_does_not_follow_symlink(
+    restricted_bundle,
+    monkeypatch,
+    tmp_path,
+):
+    """Directory replacement cannot redirect descriptor-relative reads."""
+    import os
+    import evidence_engine.restricted_verify as restricted_verify
+    import evidence_engine.trust as trust_module
+    if not restricted_verify._supports_secure_restricted_traversal():
+        pytest.skip("Secure restricted traversal unavailable")
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+    artifacts = restricted_bundle["artifacts"]
+    original_directory = artifacts.with_name("artifacts-original")
+    attacker_directory = tmp_path / "attacker-artifacts"
+    attacker_directory.mkdir()
+    # An attacker-controlled directory must not be accepted as the source.
+    for name in ("plan.json", "state.json", "commit.txt", "version.txt"):
+        (attacker_directory / name).write_bytes((artifacts / name).read_bytes())
+    (attacker_directory / "plan.json").write_bytes(b"attacker-controlled")
+    original_identity = (artifacts.stat().st_dev, artifacts.stat().st_ino)
+    original_open = os.open
+    swapped = False
+    followed_attacker_directory = False
+    pinned_directory_verified = False
+    # os.open monkeypatches alter os.supports_dir_fd membership checks.
+    monkeypatch.setattr(
+        restricted_verify, "_supports_secure_restricted_traversal", lambda: True
+    )
+    monkeypatch.setattr(
+        trust_module, "_supports_secure_trust_traversal", lambda: True
+    )
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal swapped, followed_attacker_directory, pinned_directory_verified
+        candidate = Path(path)
+        directory_fd = kwargs.get("dir_fd")
+        if candidate == Path("plan.json") and directory_fd is not None:
+            if not swapped:
+                # This occurs after the artifact directory FD was acquired.
+                artifacts.rename(original_directory)
+                artifacts.symlink_to(attacker_directory, target_is_directory=True)
+                swapped = True
+            opened_directory = os.fstat(directory_fd)
+            pinned_directory_verified = (
+                opened_directory.st_dev, opened_directory.st_ino
+            ) == original_identity
+        if swapped and candidate == artifacts / "plan.json" and directory_fd is None:
+            followed_attacker_directory = True
+        return original_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(restricted_verify.os, "open", tracked_open)
+    try:
+        verified = verify(
+            restricted_bundle,
+            frozenset({restricted_bundle["profile"]}),
+        )
+    finally:
+        if artifacts.is_symlink():
+            artifacts.unlink()
+        if original_directory.exists():
+            original_directory.rename(artifacts)
+    assert swapped, "Race injection did not execute"
+    assert pinned_directory_verified, "Artifact open used a different directory"
+    assert not followed_attacker_directory, "Artifact open followed swapped pathname"
+    assert verified is True, "Pinned original bundle should still verify"
