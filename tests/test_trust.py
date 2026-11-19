@@ -1033,3 +1033,313 @@ def test_bounded_loader_rejects_symlinked_registry_ancestor(tmp_path):
             "test-key",
             "local-claimed",
         )
+
+
+def test_secure_project_reader_closes_descriptors_on_read_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Close trust-file and directory descriptors after read failure."""
+    import os
+    from pathlib import Path
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    target = project / "public.pem"
+    target.write_bytes(b"AUTHORIZED-TRUST-MATERIAL")
+
+    original_open = os.open
+    original_read = os.read
+    original_close = os.close
+
+    opened = []
+    closed = []
+    file_descriptor = None
+    injected = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal file_descriptor
+
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+
+        if os.fspath(path) == "public.pem":
+            file_descriptor = descriptor
+
+        return descriptor
+
+    def failing_read(descriptor, size):
+        nonlocal injected
+
+        if descriptor == file_descriptor:
+            injected = True
+            raise OSError("injected trust read failure")
+
+        return original_read(descriptor, size)
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust_module.os, "open", tracked_open)
+        patch.setattr(trust_module.os, "read", failing_read)
+        patch.setattr(trust_module.os, "close", tracked_close)
+        patch.setattr(
+            trust_module,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="injected trust read failure",
+        ):
+            trust_module._read_secure_project_file(
+                project,
+                Path("public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert injected, "Trust read failure was not injected"
+    assert file_descriptor is not None
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_secure_project_reader_closes_descriptors_on_directory_open_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Close owned directory descriptors when traversal fails."""
+    import os
+    from pathlib import Path
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    (nested / "public.pem").write_bytes(b"TRUST-MATERIAL")
+
+    original_open = os.open
+    original_close = os.close
+
+    opened = []
+    closed = []
+    injected = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal injected
+
+        if os.fspath(path) == "nested":
+            injected = True
+            raise OSError("injected directory traversal failure")
+
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust_module.os, "open", tracked_open)
+        patch.setattr(trust_module.os, "close", tracked_close)
+
+        # The wrapper is not listed in os.supports_dir_fd.
+        # Preserve the verified POSIX capability during instrumentation.
+        patch.setattr(
+            trust_module,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="injected directory traversal failure",
+        ):
+            trust_module._read_secure_project_file(
+                project,
+                Path("nested/public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert injected, "Directory traversal failure was not injected"
+    assert opened, "No directory descriptors were opened"
+    assert sorted(opened) == sorted(closed)
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_secure_project_reader_closes_descriptors_on_file_open_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Close owned directory descriptors when opening the trust file fails."""
+    import os
+    from pathlib import Path
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    (nested / "public.pem").write_bytes(b"TRUST-MATERIAL")
+
+    original_open = os.open
+    original_close = os.close
+
+    opened = []
+    closed = []
+    injected = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal injected
+
+        if os.fspath(path) == "public.pem":
+            injected = True
+            raise OSError("injected trust file open failure")
+
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust_module.os, "open", tracked_open)
+        patch.setattr(trust_module.os, "close", tracked_close)
+
+        # Preserve the verified POSIX capability while os.open is wrapped.
+        patch.setattr(
+            trust_module,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="injected trust file open failure",
+        ):
+            trust_module._read_secure_project_file(
+                project,
+                Path("nested/public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert injected, "Trust file open failure was not injected"
+    assert opened, "No directory descriptors were opened"
+    assert sorted(opened) == sorted(closed)
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_secure_project_reader_closes_descriptors_on_fstat_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Close all owned descriptors when trust-file metadata inspection fails."""
+    import os
+    from pathlib import Path
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    (nested / "public.pem").write_bytes(b"TRUST-MATERIAL")
+
+    original_open = os.open
+    original_close = os.close
+    original_fstat = os.fstat
+
+    opened = []
+    closed = []
+    file_descriptor = None
+    injected = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal file_descriptor
+
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+
+        if os.fspath(path) == "public.pem":
+            file_descriptor = descriptor
+
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    def failing_fstat(descriptor):
+        nonlocal injected
+
+        if descriptor == file_descriptor:
+            injected = True
+            raise OSError("injected trust fstat failure")
+
+        return original_fstat(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust_module.os, "open", tracked_open)
+        patch.setattr(trust_module.os, "close", tracked_close)
+        patch.setattr(trust_module.os, "fstat", failing_fstat)
+
+        # Preserve the verified POSIX capability while os.open is wrapped.
+        patch.setattr(
+            trust_module,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="injected trust fstat failure",
+        ):
+            trust_module._read_secure_project_file(
+                project,
+                Path("nested/public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert injected, "Metadata inspection failure was not injected"
+    assert file_descriptor is not None
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            original_fstat(descriptor)
