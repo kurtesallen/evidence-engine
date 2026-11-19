@@ -1033,3 +1033,86 @@ def test_bounded_loader_rejects_symlinked_registry_ancestor(tmp_path):
             "test-key",
             "local-claimed",
         )
+
+
+def test_secure_project_reader_closes_descriptors_on_read_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Close trust-file and directory descriptors after read failure."""
+    import os
+    from pathlib import Path
+
+    import evidence_engine.trust as trust_module
+
+    if not trust_module._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    target = project / "public.pem"
+    target.write_bytes(b"AUTHORIZED-TRUST-MATERIAL")
+
+    original_open = os.open
+    original_read = os.read
+    original_close = os.close
+
+    opened = []
+    closed = []
+    file_descriptor = None
+    injected = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal file_descriptor
+
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+
+        if os.fspath(path) == "public.pem":
+            file_descriptor = descriptor
+
+        return descriptor
+
+    def failing_read(descriptor, size):
+        nonlocal injected
+
+        if descriptor == file_descriptor:
+            injected = True
+            raise OSError("injected trust read failure")
+
+        return original_read(descriptor, size)
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust_module.os, "open", tracked_open)
+        patch.setattr(trust_module.os, "read", failing_read)
+        patch.setattr(trust_module.os, "close", tracked_close)
+        patch.setattr(
+            trust_module,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="injected trust read failure",
+        ):
+            trust_module._read_secure_project_file(
+                project,
+                Path("public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert injected, "Trust read failure was not injected"
+    assert file_descriptor is not None
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
