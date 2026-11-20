@@ -437,11 +437,31 @@ def _read_secure_project_file(
             return content
 
         finally:
-            os.close(descriptor)
+            import sys
+
+            primary_exception_active = sys.exc_info()[0] is not None
+
+            try:
+                os.close(descriptor)
+            except OSError:
+                if not primary_exception_active:
+                    raise
 
     finally:
+        import sys
+
+        primary_exception_active = sys.exc_info()[0] is not None
+        close_error = None
+
         for descriptor in reversed(descriptors):
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+
+        if close_error is not None and not primary_exception_active:
+            raise close_error
 
 
 _RESTRICTED_TRUST_REGISTRY_LIMIT = 64 * 1024
