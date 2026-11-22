@@ -25,7 +25,7 @@ from evidence_engine.bundle_publication import resolve_current_generation
 from evidence_engine.ci_provenance import capture_ci_context
 from evidence_engine.collect import provenance_for
 from evidence_engine.sanitization import TERRAFORM_JSON_CONTENT_RULE_VERSION
-from evidence_engine.trust import resolve_trusted_key
+from evidence_engine.trust import load_trusted_key_bytes, resolve_trusted_key
 from evidence_engine.verify import verify_bundle
 
 
@@ -362,7 +362,7 @@ def assert_negative_paths(
                 "Original registry does not authorize the CI source"
             )
 
-        original_key = resolve_trusted_key(
+        original_key_bytes = load_trusted_key_bytes(
             TRUST_REGISTRY,
             expected_key_id,
             "github-actions-claimed",
@@ -377,7 +377,7 @@ def assert_negative_paths(
 
         test_key = test_registry_dir / relative_key
         test_key.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(original_key, test_key)
+        test_key.write_bytes(original_key_bytes)
 
         # Preserve a structurally valid registry but remove CI authorization.
         entry["allowed_sources"] = ["local-claimed"]

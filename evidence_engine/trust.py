@@ -557,7 +557,44 @@ def load_bounded_trusted_key(
     return public_key_bytes
 
 
+def _validate_trust_descriptor(
+    fd: int,
+    label: str,
+    *,
+    allow_sticky_ancestor: bool = False,
+) -> os.stat_result:
+    """Validate POSIX trust material ownership and write permissions."""
+    try:
+        metadata = os.fstat(fd)
+        effective_uid = os.geteuid()
+    except OSError as exc:
+        raise ValueError(
+            f"{label} ownership or permissions cannot be inspected"
+        ) from exc
 
+    if metadata.st_uid not in (effective_uid, 0):
+        raise ValueError(
+            f"{label} has untrusted ownership"
+        )
+
+    writable = bool(
+        metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    )
+
+    if writable:
+        protected_sticky_ancestor = (
+            allow_sticky_ancestor
+            and metadata.st_uid == 0
+            and bool(metadata.st_mode & stat.S_ISVTX)
+            and stat.S_ISDIR(metadata.st_mode)
+        )
+
+        if not protected_sticky_ancestor:
+            raise ValueError(
+                f"{label} has unsafe permissions"
+            )
+
+    return metadata
 
 
 
@@ -610,6 +647,10 @@ def _read_from_pinned_root(
                 dir_fd=current,
             )
             descriptors.append(current)
+            _validate_trust_descriptor(
+                current,
+                f"{label} parent directory",
+            )
 
         file_fd = os.open(
             components[-1],
@@ -618,7 +659,10 @@ def _read_from_pinned_root(
         )
 
         try:
-            metadata = os.fstat(file_fd)
+            metadata = _validate_trust_descriptor(
+                file_fd,
+                label,
+            )
 
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(
@@ -680,7 +724,7 @@ def _read_from_pinned_root(
 
 
 def _open_pinned_project_root(project_root: Path) -> int:
-    """Open a project directory without following symlink components."""
+    """Open and validate a project root without following symlinks."""
     project_root = Path(project_root)
 
     if not project_root.is_absolute():
@@ -696,7 +740,7 @@ def _open_pinned_project_root(project_root: Path) -> int:
     current = None
 
     try:
-        for component in project_root.parts:
+        for index, component in enumerate(project_root.parts):
             next_fd = os.open(
                 component,
                 flags,
@@ -708,6 +752,14 @@ def _open_pinned_project_root(project_root: Path) -> int:
 
             if previous_fd is not None:
                 os.close(previous_fd)
+
+            _validate_trust_descriptor(
+                current,
+                "Project path directory",
+                allow_sticky_ancestor=(
+                    index < len(project_root.parts) - 1
+                ),
+            )
 
         if current is None:
             raise ValueError("Invalid secure project root")
@@ -722,11 +774,11 @@ def _open_pinned_project_root(project_root: Path) -> int:
 
 
 def _open_pinned_registry_dir(root_fd: int, name: str) -> int:
-    """Pin the registry directory relative to the open parent directory."""
+    """Open and validate a registry directory relative to the pinned root."""
     if name in ("", ".", "..") or "/" in name or "\\" in name:
         raise ValueError("Invalid trust registry directory name")
 
-    return os.open(
+    descriptor = os.open(
         name,
         os.O_RDONLY
         | os.O_DIRECTORY
@@ -735,6 +787,16 @@ def _open_pinned_registry_dir(root_fd: int, name: str) -> int:
         dir_fd=root_fd,
     )
 
+    try:
+        _validate_trust_descriptor(
+            descriptor,
+            "Trust registry directory",
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    return descriptor
 
 def load_trusted_key_bytes(
     registry_path: Path,
