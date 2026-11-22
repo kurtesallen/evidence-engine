@@ -31,7 +31,7 @@ from evidence_engine.sanitization import (
 )
 from evidence_engine.schema import validate_manifest
 from evidence_engine.signing import KEY_ID, sign_bytes
-from evidence_engine.trust import resolve_trusted_key
+from evidence_engine.trust import load_trusted_key_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -474,14 +474,13 @@ def verify_bundle(
             print("FAIL: unexpected signing key ID")
             return False
 
-        # Resolve the trusted public key authorized for this source.
-        trusted_key_path = resolve_trusted_key(
+        # Authorize and securely load the trusted key bytes.
+        # Do not reopen a pathname after key validation.
+        public_key_pem = load_trusted_key_bytes(
             trust_registry,
             expected_key_id,
             manifest["provenance"]["source"],
         )
-
-        public_key_pem = trusted_key_path.read_bytes()
 
         # Load PEM or DER public key material.
         try:

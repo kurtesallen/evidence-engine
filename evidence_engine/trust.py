@@ -557,6 +557,352 @@ def load_bounded_trusted_key(
     return public_key_bytes
 
 
+
+
+
+
+def _read_from_pinned_root(
+    root_fd: int,
+    relative_path: Path,
+    *,
+    label: str,
+    maximum: int,
+) -> bytes:
+    """Read a bounded regular file relative to an open directory."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError(f"Invalid {label} size limit")
+
+    relative_path = Path(relative_path)
+
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("Invalid relative trust file path")
+
+    components = [
+        part for part in relative_path.parts
+        if part not in ("", ".")
+    ]
+
+    if not components:
+        raise ValueError("Secure trust file path is empty")
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+
+    descriptors = []
+    current = root_fd
+
+    try:
+        for component in components[:-1]:
+            current = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+
+        file_fd = os.open(
+            components[-1],
+            file_flags,
+            dir_fd=current,
+        )
+
+        try:
+            metadata = os.fstat(file_fd)
+
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"{label} is not a regular file"
+                )
+
+            if metadata.st_size > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            chunks = []
+            remaining = maximum + 1
+
+            while remaining:
+                chunk = os.read(file_fd, remaining)
+
+                if not chunk:
+                    break
+
+                chunks.append(chunk)
+                remaining -= len(chunk)
+
+            result = b"".join(chunks)
+
+            if len(result) > maximum:
+                raise ValueError(
+                    f"{label} exceeds size limit"
+                )
+
+            return result
+
+        finally:
+            import sys
+
+            primary_error = sys.exc_info()[0] is not None
+
+            try:
+                os.close(file_fd)
+            except OSError:
+                if not primary_error:
+                    raise
+
+    finally:
+        import sys
+
+        primary_error = sys.exc_info()[0] is not None
+        close_error = None
+
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+
+        if close_error is not None and not primary_error:
+            raise close_error
+
+
+def _open_pinned_project_root(project_root: Path) -> int:
+    """Open a project directory without following symlink components."""
+    project_root = Path(project_root)
+
+    if not project_root.is_absolute():
+        raise ValueError("Secure project root must be absolute")
+
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+    current = None
+
+    try:
+        for component in project_root.parts:
+            next_fd = os.open(
+                component,
+                flags,
+                **({"dir_fd": current} if current is not None else {}),
+            )
+
+            previous_fd = current
+            current = next_fd
+
+            if previous_fd is not None:
+                os.close(previous_fd)
+
+        if current is None:
+            raise ValueError("Invalid secure project root")
+
+        result = current
+        current = None
+        return result
+
+    finally:
+        if current is not None:
+            os.close(current)
+
+
+def _open_pinned_registry_dir(root_fd: int, name: str) -> int:
+    """Pin the registry directory relative to the open parent directory."""
+    if name in ("", ".", "..") or "/" in name or "\\" in name:
+        raise ValueError("Invalid trust registry directory name")
+
+    return os.open(
+        name,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=root_fd,
+    )
+
+
+def load_trusted_key_bytes(
+    registry_path: Path,
+    key_id: str,
+    source: str,
+) -> bytes:
+    """Load an authorized RSA-2048 key without reopening its pathname.
+
+    POSIX uses descriptor-relative, no-follow traversal.
+    Windows uses bounded compatibility reads. Its trust directories
+    must not be writable by untrusted users.
+    """
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    registry_path = Path(registry_path)
+
+    if ".." in registry_path.parts:
+        raise ValueError(
+            "Trust registry path contains parent traversal"
+        )
+
+    registry_path = Path(
+        os.path.abspath(os.fspath(registry_path))
+    )
+
+    registry_dir = registry_path.parent
+    project_root = registry_dir.parent
+
+    registry_relative = Path(
+        registry_dir.name,
+        registry_path.name,
+    )
+
+    registry_fd = None
+    if _supports_secure_trust_traversal():
+        root_fd = _open_pinned_project_root(project_root)
+        try:
+            registry_fd = _open_pinned_registry_dir(
+                root_fd,
+                registry_dir.name,
+            )
+        except BaseException:
+            os.close(root_fd)
+            raise
+    elif os.name == "nt":
+        root_fd = None
+    else:
+        raise ValueError(
+            "Secure trust traversal is unavailable"
+        )
+
+    def read_file(
+        relative_path: Path,
+        *,
+        label: str,
+        maximum: int,
+    ) -> bytes:
+        if root_fd is not None:
+            # Both registry and keys beneath its directory are read
+            # through the same pinned directory descriptor. Keys that
+            # resolve to siblings (e.g. ../keys) use the pinned parent.
+            parts = Path(relative_path).parts
+            if parts and parts[0] == registry_dir.name:
+                return _read_from_pinned_root(
+                    registry_fd,
+                    Path(*parts[1:]),
+                    label=label,
+                    maximum=maximum,
+                )
+            return _read_from_pinned_root(
+                root_fd,
+                relative_path,
+                label=label,
+                maximum=maximum,
+            )
+
+        return _read_bounded_trust_file(
+            project_root / relative_path,
+            label=label,
+            maximum=maximum,
+        )
+
+    try:
+        registry_bytes = read_file(
+            registry_relative,
+            label="Trust registry",
+            maximum=_RESTRICTED_TRUST_REGISTRY_LIMIT,
+        )
+
+        try:
+            registry = json.loads(registry_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Cannot load trust registry"
+            ) from exc
+
+        registry = _validate_trust_registry(registry)
+
+        entry = _authorize_trusted_key(
+            registry,
+            key_id,
+            source,
+        )
+
+        configured = entry["public_key"]
+
+        if (
+            PurePosixPath(configured).is_absolute()
+            or PureWindowsPath(configured).drive
+            or PureWindowsPath(configured).root
+            or "\\" in configured
+        ):
+            raise ValueError(
+                "Trusted public key path must be relative"
+            )
+
+        components = [registry_dir.name]
+
+        for part in PurePosixPath(configured).parts:
+            if part in ("", "."):
+                continue
+
+            if part == "..":
+                if not components:
+                    raise ValueError(
+                        "Public key path escapes the configured project"
+                    )
+                components.pop()
+                continue
+
+            components.append(part)
+
+        if not components:
+            raise ValueError(
+                "Trusted public key path is empty"
+            )
+
+        key_relative = Path(*components)
+
+        public_key_bytes = read_file(
+            key_relative,
+            label="Trusted public key",
+            maximum=_RESTRICTED_TRUST_PUBLIC_KEY_LIMIT,
+        )
+
+        try:
+            key = serialization.load_pem_public_key(
+                public_key_bytes
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "Trusted public key cannot be loaded"
+            ) from exc
+
+        if not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048:
+            raise ValueError("Trusted key must be RSA-2048")
+
+        return public_key_bytes
+
+    finally:
+        try:
+            if registry_fd is not None:
+                os.close(registry_fd)
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+
+
 def resolve_trusted_key(
     registry_path: Path,
     key_id: str,
