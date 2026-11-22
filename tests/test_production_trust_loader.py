@@ -464,3 +464,408 @@ def test_root_layout_remains_pinned_after_project_replacement(
         "Trust registry",
         "Trusted public key",
     ]
+
+
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="Requires POSIX descriptor-relative traversal",
+)
+def test_production_loader_rejects_nested_key_directory_replacement(
+    trust_material,
+    monkeypatch,
+):
+    """A nested directory swap must not silently substitute a trust key."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    attacker_private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    attacker_public_key = attacker_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    original_reader = trust._read_from_pinned_root
+    replaced = False
+
+    def replace_after_registry_read(
+        root_fd,
+        relative_path,
+        *,
+        label,
+        maximum,
+    ):
+        nonlocal replaced
+
+        result = original_reader(
+            root_fd,
+            relative_path,
+            label=label,
+            maximum=maximum,
+        )
+
+        if label == "Trust registry" and not replaced:
+            replaced = True
+            keys.rename(project / "original_keys")
+            keys.mkdir()
+            (keys / "public.pem").write_bytes(attacker_public_key)
+
+        return result
+
+    monkeypatch.setattr(
+        trust,
+        "_read_from_pinned_root",
+        replace_after_registry_read,
+    )
+
+    try:
+        loaded = trust.load_trusted_key_bytes(
+            registry_path,
+            KEY_ID,
+            SOURCE,
+        )
+    except (ValueError, OSError):
+        return  # Rejecting the replacement is acceptable.
+
+    assert loaded == expected, (
+        "Nested directory replacement substituted an unauthorized key"
+    )
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="Requires POSIX filesystem permissions",
+)
+@pytest.mark.parametrize(
+    "target",
+    ["project", "config", "registry", "key"],
+)
+@pytest.mark.parametrize("write_bit", [0o020, 0o002])
+def test_production_loader_rejects_untrusted_writable_material(
+    trust_material,
+    target,
+    write_bit,
+):
+    """Production trust material must reject group/other write access."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    targets = {
+        "project": project,
+        "config": config,
+        "registry": registry_path,
+        "key": key_path,
+    }
+
+    path = targets[target]
+    original_mode = path.stat().st_mode & 0o777
+
+    try:
+        path.chmod(original_mode | write_bit)
+
+        with pytest.raises(ValueError, match="permissions|writable"):
+            trust.load_trusted_key_bytes(
+                registry_path,
+                KEY_ID,
+                SOURCE,
+            )
+    finally:
+        path.chmod(original_mode)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["project", "config", "registry", "key"],
+)
+def test_production_loader_rejects_untrusted_ownership(
+    trust_material,
+    monkeypatch,
+    target,
+):
+    """Reject trust descriptors owned by an unrelated user."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    targets = {
+        "project": project,
+        "config": config,
+        "registry": registry_path,
+        "key": key_path,
+    }
+
+    original_fstat = trust.os.fstat
+    target_stat = targets[target].stat()
+
+    def untrusted_fstat(fd):
+        metadata = original_fstat(fd)
+
+        if (
+            metadata.st_dev == target_stat.st_dev
+            and metadata.st_ino == target_stat.st_ino
+        ):
+            values = list(metadata)
+            values[4] = trust.os.geteuid() + 10000
+            return trust.os.stat_result(values)
+
+        return metadata
+
+    monkeypatch.setattr(trust.os, "fstat", untrusted_fstat)
+
+    with pytest.raises(ValueError, match="ownership"):
+        trust.load_trusted_key_bytes(
+            registry_path,
+            KEY_ID,
+            SOURCE,
+        )
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["project", "config", "registry", "key"],
+)
+def test_production_loader_fails_closed_on_fstat_error(
+    trust_material,
+    monkeypatch,
+    target,
+):
+    """Descriptor metadata failures must reject trust material."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    targets = {
+        "project": project,
+        "config": config,
+        "registry": registry_path,
+        "key": key_path,
+    }
+
+    original_fstat = trust.os.fstat
+    target_stat = targets[target].stat()
+
+    def failing_fstat(fd):
+        metadata = original_fstat(fd)
+
+        if (
+            metadata.st_dev == target_stat.st_dev
+            and metadata.st_ino == target_stat.st_ino
+        ):
+            raise OSError("simulated metadata failure")
+
+        return metadata
+
+    monkeypatch.setattr(trust.os, "fstat", failing_fstat)
+
+    with pytest.raises(ValueError, match="inspected"):
+        trust.load_trusted_key_bytes(
+            registry_path,
+            KEY_ID,
+            SOURCE,
+        )
+
+
+@pytest.mark.parametrize("write_bit", [0o020, 0o002])
+def test_production_loader_rejects_writable_nested_key_directory(
+    trust_material,
+    write_bit,
+):
+    """Nested key directories must not be group/other writable."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+
+    nested = keys / "nested"
+    nested.mkdir()
+    nested_key = nested / "public.pem"
+    nested_key.write_bytes(key_path.read_bytes())
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/nested/public.pem",
+    )
+
+    original_mode = nested.stat().st_mode & 0o777
+
+    try:
+        nested.chmod(original_mode | write_bit)
+
+        with pytest.raises(ValueError, match="permissions"):
+            trust.load_trusted_key_bytes(
+                registry_path,
+                KEY_ID,
+                SOURCE,
+            )
+    finally:
+        nested.chmod(original_mode)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["project", "config", "registry", "key"],
+)
+def test_production_loader_closes_descriptors_on_validation_failure(
+    trust_material,
+    monkeypatch,
+    target,
+):
+    """Every descriptor opened by the loader closes after rejection."""
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX traversal unavailable")
+
+    project, config, keys, key_path, expected, registry = trust_material
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    targets = {
+        "project": project,
+        "config": config,
+        "registry": registry_path,
+        "key": key_path,
+    }
+
+    target_stat = targets[target].stat()
+    original_fstat = os.fstat
+    original_open = os.open
+    original_close = os.close
+
+    opened = []
+    closed = []
+    injected = False
+
+    def tracked_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def tracked_close(fd):
+        closed.append(fd)
+        return original_close(fd)
+
+    def failing_fstat(fd):
+        nonlocal injected
+
+        metadata = original_fstat(fd)
+
+        if (
+            metadata.st_dev == target_stat.st_dev
+            and metadata.st_ino == target_stat.st_ino
+        ):
+            injected = True
+            raise OSError("simulated metadata failure")
+
+        return metadata
+
+    monkeypatch.setattr(trust.os, "open", tracked_open)
+    monkeypatch.setattr(trust.os, "close", tracked_close)
+    monkeypatch.setattr(trust.os, "fstat", failing_fstat)
+
+    monkeypatch.setattr(
+        trust,
+        "_supports_secure_trust_traversal",
+        lambda: True,
+    )
+
+    with pytest.raises(ValueError, match="inspected"):
+        trust.load_trusted_key_bytes(
+            registry_path,
+            KEY_ID,
+            SOURCE,
+        )
+
+    assert injected, "Target descriptor was never inspected"
+    assert opened, "No descriptors were opened"
+    assert sorted(opened) == sorted(closed)
+
+@pytest.mark.parametrize(
+    ("mode", "owner_is_root", "allow_ancestor", "accepted"),
+    [
+        (0o41777, True, True, True),
+        (0o40777, True, True, False),
+        (0o41777, True, False, False),
+        (0o41777, False, True, False),
+    ],
+)
+def test_trust_descriptor_sticky_ancestor_policy(
+    tmp_path,
+    monkeypatch,
+    mode,
+    owner_is_root,
+    allow_ancestor,
+    accepted,
+):
+    """Only root-owned sticky ancestors receive the write exception."""
+    if os.name != "posix":
+        pytest.skip("Requires POSIX descriptor metadata")
+
+    directory = tmp_path / "ancestor"
+    directory.mkdir()
+
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+
+    original_fstat = trust.os.fstat
+    original_euid = trust.os.geteuid
+
+    try:
+        def synthetic_fstat(candidate):
+            metadata = original_fstat(candidate)
+
+            if candidate != fd:
+                return metadata
+
+            values = list(metadata)
+            values[0] = mode
+            values[4] = 0 if owner_is_root else original_euid() + 10000
+
+            return os.stat_result(values)
+
+        monkeypatch.setattr(trust.os, "fstat", synthetic_fstat)
+
+        if accepted:
+            trust._validate_trust_descriptor(
+                fd,
+                "Ancestor",
+                allow_sticky_ancestor=allow_ancestor,
+            )
+        else:
+            with pytest.raises(ValueError):
+                trust._validate_trust_descriptor(
+                    fd,
+                    "Ancestor",
+                    allow_sticky_ancestor=allow_ancestor,
+                )
+    finally:
+        os.close(fd)
