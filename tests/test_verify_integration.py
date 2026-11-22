@@ -409,3 +409,45 @@ def test_tampered_published_generation_does_not_advance_acceptance(
 
     assert replay.success is False
     assert replay.error == "bundle-replay-detected"
+
+def test_verification_does_not_reopen_resolved_trust_key(
+    signed_bundle,
+    monkeypatch,
+):
+    """Verification must not reopen a key after trust resolution."""
+    from pathlib import Path
+
+    import evidence_engine.verify as verify_module
+
+    original_read_bytes = Path.read_bytes
+    key_path = (
+        signed_bundle["trust_registry"].parent.parent
+        / "keys"
+        / "public.pem"
+    ).resolve()
+
+    key_reads = []
+
+    def tracked_read_bytes(path):
+        if Path(path).resolve() == key_path:
+            key_reads.append(path)
+
+            if len(key_reads) > 1:
+                raise AssertionError(
+                    "Trusted public key reopened after validation"
+                )
+
+        return original_read_bytes(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", tracked_read_bytes)
+
+        assert verify_module.verify_bundle(
+            signed_bundle["artifacts"],
+            signed_bundle["manifest"],
+            signed_bundle["signature"],
+            signed_bundle["trust_registry"],
+            signed_bundle["key_id"],
+        )
+
+    assert len(key_reads) == 0
