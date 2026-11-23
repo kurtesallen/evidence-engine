@@ -380,13 +380,25 @@ def _read_secure_project_file(
         current = os.open(root_parts[0], directory_flags)
         descriptors.append(current)
 
-        for part in root_parts[1:]:
+        _validate_trust_descriptor(
+            current,
+            "Project path directory",
+            allow_sticky_ancestor=len(root_parts) > 1,
+        )
+
+        for index, part in enumerate(root_parts[1:], start=1):
             current = os.open(
                 part,
                 directory_flags,
                 dir_fd=current,
             )
             descriptors.append(current)
+
+            _validate_trust_descriptor(
+                current,
+                "Project path directory",
+                allow_sticky_ancestor=index < len(root_parts) - 1,
+            )
 
         for part in components[:-1]:
             current = os.open(
@@ -396,6 +408,11 @@ def _read_secure_project_file(
             )
             descriptors.append(current)
 
+            _validate_trust_descriptor(
+                current,
+                f"{label} parent directory",
+            )
+
         descriptor = os.open(
             components[-1],
             file_flags,
@@ -403,7 +420,10 @@ def _read_secure_project_file(
         )
 
         try:
-            metadata = os.fstat(descriptor)
+            metadata = _validate_trust_descriptor(
+                descriptor,
+                label,
+            )
 
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(
