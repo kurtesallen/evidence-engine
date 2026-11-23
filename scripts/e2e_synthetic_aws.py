@@ -31,6 +31,27 @@ from evidence_engine.verify import verify_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 TRUST_REGISTRY = ROOT / "trust" / "registry.json"
+TRUST_REGISTRY_ENV = "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH"
+
+
+def configured_trust_registry() -> Path:
+    """Return the configured consumer registry or repository default."""
+    configured = os.environ.get(TRUST_REGISTRY_ENV)
+
+    if configured is None:
+        return TRUST_REGISTRY
+
+    if not configured.strip():
+        raise ValueError(f"{TRUST_REGISTRY_ENV} must not be empty")
+
+    path = Path(configured)
+
+    if not path.is_absolute():
+        raise ValueError(f"{TRUST_REGISTRY_ENV} must be an absolute path")
+
+    return path
+
+
 REFERENCE_FILE = ROOT / "bundle-reference.json"
 SYNTHETIC_TERRAFORM_VERSION = "1.9.0"
 STREAM_ID = "evidence-integration-test"
@@ -250,6 +271,7 @@ def assert_negative_paths(
     payload: dict[str, Any],
     consumer: Any,
     expected_key_id: str,
+    trust_registry: Path,
 ) -> None:
     """Exercise rejection paths without modifying remote S3 objects."""
     raw_reference = payload.get("bundle_reference")
@@ -282,7 +304,7 @@ def assert_negative_paths(
     #    that is not authorized by policy.
     try:
         resolve_trusted_key(
-            TRUST_REGISTRY,
+            trust_registry,
             expected_key_id,
             "local-claimed",
         )
@@ -318,7 +340,7 @@ def assert_negative_paths(
             baseline / "artifacts",
             baseline / "manifest.json",
             baseline / "manifest.sig",
-            TRUST_REGISTRY,
+            trust_registry,
             expected_key_id,
         )
 
@@ -332,7 +354,7 @@ def assert_negative_paths(
         # Test full verification against a temporary restrictive trust
         # registry. Preserve the valid manifest, signature, and artifacts.
         registry_data = json.loads(
-            TRUST_REGISTRY.read_text(encoding="utf-8")
+            trust_registry.read_text(encoding="utf-8")
         )
         entries = registry_data.get("keys")
 
@@ -363,7 +385,7 @@ def assert_negative_paths(
             )
 
         original_key_bytes = load_trusted_key_bytes(
-            TRUST_REGISTRY,
+            trust_registry,
             expected_key_id,
             "github-actions-claimed",
         )
@@ -430,7 +452,7 @@ def assert_negative_paths(
                 tampered / "artifacts",
                 tampered / "manifest.json",
                 tampered / "manifest.sig",
-                TRUST_REGISTRY,
+                trust_registry,
                 expected_key_id,
             )
 
@@ -761,6 +783,7 @@ def consume() -> None:
     require_env("EVIDENCE_ENGINE_S3_BUCKET")
     require_env("EVIDENCE_ENGINE_S3_KMS_KEY_ID")
     signing_key_id = require_env("EVIDENCE_ENGINE_SIGNING_KEY_ID")
+    trust_registry = configured_trust_registry()
 
     if not REFERENCE_FILE.is_file():
         raise RuntimeError(f"Producer reference is missing: {REFERENCE_FILE}")
@@ -777,14 +800,19 @@ def consume() -> None:
         artifacts_root=ROOT / ".e2e-consumer-unused",
         expected_source="github-actions-claimed",
         expected_key_id=signing_key_id,
-        trust_registry_path=TRUST_REGISTRY,
+        trust_registry_path=trust_registry,
         configure_remote_storage=True,
         require_remote_bundle=True,
         consumer_id=require_env("EVIDENCE_ENGINE_CONSUMER_ID"),
         expected_stream_id=require_env("EVIDENCE_ENGINE_EXPECTED_STREAM_ID"),
     )
 
-    assert_negative_paths(payload, consumer, signing_key_id)
+    assert_negative_paths(
+        payload,
+        consumer,
+        signing_key_id,
+        trust_registry,
+    )
     assert_dynamodb_rollback_protection()
     assert_dynamodb_concurrent_acceptance()
 
