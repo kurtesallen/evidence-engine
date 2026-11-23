@@ -1325,16 +1325,19 @@ def test_secure_project_reader_closes_descriptors_on_fstat_failure(
         )
 
         with pytest.raises(
-            OSError,
-            match="injected trust fstat failure",
-        ):
+            ValueError,
+            match="ownership or permissions cannot be inspected",
+        ) as exc_info:
             trust_module._read_secure_project_file(
                 project,
                 Path("nested/public.pem"),
                 label="Trust test",
                 maximum=1024,
             )
-
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == (
+        "injected trust fstat failure"
+    )
     assert injected, "Metadata inspection failure was not injected"
     assert file_descriptor is not None
     assert opened
@@ -1609,3 +1612,181 @@ def test_secure_project_reader_preserves_read_error_during_file_close_failure(
     for descriptor in opened:
         with pytest.raises(OSError):
             original_fstat(descriptor)
+
+
+
+@pytest.mark.parametrize(
+    ("target", "write_bit"),
+    [
+        ("file", 0o020),
+        ("directory", 0o002),
+    ],
+)
+def test_secure_project_reader_rejects_unsafe_permissions(
+    tmp_path,
+    target,
+    write_bit,
+):
+    """Reject writable trust material and its parent directories."""
+    import os
+
+    from evidence_engine.trust import (
+        _read_secure_project_file,
+        _supports_secure_trust_traversal,
+    )
+
+    if not _supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    keys = project / "keys"
+    keys.mkdir(parents=True)
+
+    public_key = keys / "public.pem"
+    public_key.write_bytes(b"TRUST-MATERIAL")
+
+    path = public_key if target == "file" else keys
+    original_mode = path.stat().st_mode & 0o777
+
+    try:
+        path.chmod(original_mode | write_bit)
+
+        with pytest.raises(ValueError, match="unsafe permissions"):
+            _read_secure_project_file(
+                project,
+                Path("keys/public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+    finally:
+        path.chmod(original_mode)
+
+
+def test_secure_project_reader_rejects_untrusted_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    """Reject a trust file reporting ownership by another user."""
+    import os
+
+    import evidence_engine.trust as trust
+
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    keys = project / "keys"
+    keys.mkdir(parents=True)
+
+    public_key = keys / "public.pem"
+    public_key.write_bytes(b"TRUST-MATERIAL")
+
+    target_stat = public_key.stat()
+    original_fstat = os.fstat
+
+    def untrusted_fstat(fd):
+        metadata = original_fstat(fd)
+
+        if (
+            metadata.st_dev == target_stat.st_dev
+            and metadata.st_ino == target_stat.st_ino
+        ):
+            values = list(metadata)
+            values[4] = os.geteuid() + 10000
+            return os.stat_result(values)
+
+        return metadata
+
+    monkeypatch.setattr(trust.os, "fstat", untrusted_fstat)
+
+    with pytest.raises(ValueError, match="untrusted ownership"):
+        trust._read_secure_project_file(
+            project,
+            Path("keys/public.pem"),
+            label="Trust test",
+            maximum=1024,
+        )
+
+
+def test_secure_project_reader_closes_descriptors_on_directory_metadata_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """Fail closed and release descriptors on directory metadata failure."""
+    import os
+
+    import evidence_engine.trust as trust
+
+    if not trust._supports_secure_trust_traversal():
+        pytest.skip("Secure POSIX trust traversal unavailable")
+
+    project = tmp_path / "project"
+    keys = project / "keys"
+    keys.mkdir(parents=True)
+    (keys / "public.pem").write_bytes(b"TRUST-MATERIAL")
+
+    target_stat = keys.stat()
+
+    original_open = os.open
+    original_close = os.close
+    original_fstat = os.fstat
+
+    opened = []
+    closed = []
+    injected = False
+
+    def tracked_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def tracked_close(fd):
+        closed.append(fd)
+        return original_close(fd)
+
+    def failing_fstat(fd):
+        nonlocal injected
+
+        metadata = original_fstat(fd)
+
+        if (
+            metadata.st_dev == target_stat.st_dev
+            and metadata.st_ino == target_stat.st_ino
+        ):
+            injected = True
+            raise OSError("injected directory metadata failure")
+
+        return metadata
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trust.os, "open", tracked_open)
+        patch.setattr(trust.os, "close", tracked_close)
+        patch.setattr(trust.os, "fstat", failing_fstat)
+        patch.setattr(
+            trust,
+            "_supports_secure_trust_traversal",
+            lambda: True,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="ownership or permissions cannot be inspected",
+        ) as exc_info:
+            trust._read_secure_project_file(
+                project,
+                Path("keys/public.pem"),
+                label="Trust test",
+                maximum=1024,
+            )
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == (
+        "injected directory metadata failure"
+    )
+    assert injected
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+    for fd in opened:
+        with pytest.raises(OSError):
+            original_fstat(fd)
