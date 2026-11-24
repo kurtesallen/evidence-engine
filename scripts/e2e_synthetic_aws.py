@@ -30,27 +30,31 @@ from evidence_engine.verify import verify_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRUST_REGISTRY = ROOT / "trust" / "registry.json"
 TRUST_REGISTRY_ENV = "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH"
 
-
 def configured_trust_registry() -> Path:
-    """Return the configured consumer registry or repository default."""
+    """Require an explicitly configured deployment trust registry."""
+
     configured = os.environ.get(TRUST_REGISTRY_ENV)
 
-    if configured is None:
-        return TRUST_REGISTRY
-
-    if not configured.strip():
-        raise ValueError(f"{TRUST_REGISTRY_ENV} must not be empty")
+    if configured is None or not configured.strip():
+        raise ValueError(
+            f"{TRUST_REGISTRY_ENV} must not be empty"
+        )
 
     path = Path(configured)
 
     if not path.is_absolute():
-        raise ValueError(f"{TRUST_REGISTRY_ENV} must be an absolute path")
+        raise ValueError(
+            f"{TRUST_REGISTRY_ENV} must be an absolute path"
+        )
+
+    if ".." in path.parts:
+        raise ValueError(
+            f"{TRUST_REGISTRY_ENV} must not contain parent traversal"
+        )
 
     return path
-
 
 REFERENCE_FILE = ROOT / "bundle-reference.json"
 SYNTHETIC_TERRAFORM_VERSION = "1.9.0"
@@ -100,9 +104,6 @@ def capture_and_check_ci_context() -> dict[str, str]:
 
     if context["stream_id"] != STREAM_ID:
         raise RuntimeError("Unexpected integration stream ID")
-
-    if not TRUST_REGISTRY.is_file():
-        raise RuntimeError(f"Trusted-key registry is missing: {TRUST_REGISTRY}")
 
     return context
 
@@ -190,6 +191,8 @@ def build_ci_provenance(context: dict[str, str]) -> dict[str, str]:
 
 
 def produce() -> None:
+    trust_registry = configured_trust_registry()
+
     context = capture_and_check_ci_context()
     region = require_env("AWS_REGION")
     signing_key_id = require_env("EVIDENCE_ENGINE_SIGNING_KEY_ID")
@@ -214,7 +217,7 @@ def produce() -> None:
             artifacts_root=source,
             output_dir=output,
             provenance=build_ci_provenance(context),
-            trust_registry_path=TRUST_REGISTRY,
+            trust_registry_path=trust_registry,
             signing_mode="kms",
             kms_key_id=signing_key_id,
             aws_region=region,

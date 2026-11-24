@@ -84,7 +84,6 @@ jobs:
           test -n "$EVIDENCE_ENGINE_S3_KMS_KEY_ID"
           test -n "$EVIDENCE_ENGINE_SIGNING_KEY_ID"
           test -f trust/registry.json
-          test -f trust/keys/evidence-engine-signing-public.pem
 
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6.3.0
@@ -109,6 +108,27 @@ jobs:
               ;;
           esac
 
+      - name: Stage producer trust material and enforce deployment preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          trust_root="$(mktemp -d "$HOME/evidence-engine-trust.XXXXXXXX")"
+          staged_trust="$trust_root/staged"
+
+          python -m evidence_engine.trust_deployment \
+            --source-registry "$GITHUB_WORKSPACE/trust/registry.json" \
+            --destination "$staged_trust"
+
+          python -m evidence_engine.trust_preflight \
+            --trust-registry "$staged_trust/registry.json" \
+            --expected-key-id "$EVIDENCE_ENGINE_SIGNING_KEY_ID" \
+            --expected-source github-actions-claimed
+
+          echo "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH=$staged_trust/registry.json" \
+            >> "$GITHUB_ENV"
+
       - name: Create, sanitize, sign, and upload synthetic bundle
         env:
           GITHUB_ACTIONS: "true"
@@ -119,7 +139,11 @@ jobs:
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: python scripts/e2e_synthetic_aws.py produce
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${EVIDENCE_ENGINE_TRUST_REGISTRY_PATH:-}"
+          python scripts/e2e_synthetic_aws.py produce
 
       - name: Transfer versioned bundle reference to consumer job
         uses: actions/upload-artifact@v7.0.2
@@ -177,7 +201,6 @@ jobs:
           test -n "$EVIDENCE_ENGINE_EXPECTED_STREAM_ID"
           test -n "$EVIDENCE_ENGINE_SIGNING_KEY_ID"
           test -f trust/registry.json
-          test -f trust/keys/evidence-engine-signing-public.pem
 
       - name: Download producer bundle reference
         uses: actions/download-artifact@v8.0.2
@@ -215,19 +238,18 @@ jobs:
           umask 077
 
           trust_root="$(mktemp -d "$HOME/evidence-engine-trust.XXXXXXXX")"
-          mkdir -m 700 "$trust_root/keys"
+          staged_trust="$trust_root/staged"
 
-          install -m 600 trust/registry.json "$trust_root/registry.json"
-          install -m 600 \
-            trust/keys/evidence-engine-signing-public.pem \
-            "$trust_root/keys/evidence-engine-signing-public.pem"
+          python -m evidence_engine.trust_deployment \
+            --source-registry "$GITHUB_WORKSPACE/trust/registry.json" \
+            --destination "$staged_trust"
 
           python -m evidence_engine.trust_preflight \
-            --trust-registry "$trust_root/registry.json" \
+            --trust-registry "$staged_trust/registry.json" \
             --expected-key-id "$EVIDENCE_ENGINE_SIGNING_KEY_ID" \
             --expected-source github-actions-claimed
 
-          echo "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH=$trust_root/registry.json" \
+          echo "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH=$staged_trust/registry.json" \
             >> "$GITHUB_ENV"
 
       - name: Verify tampering, trust policy, rollback, concurrency, acceptance, and replay
