@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -876,3 +878,105 @@ def test_trust_descriptor_sticky_ancestor_policy(
                 )
     finally:
         os.close(fd)
+
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "mkfifo"),
+    reason="Requires POSIX named-pipe support",
+)
+@pytest.mark.parametrize("target", ["registry", "key"])
+def test_production_loader_rejects_fifo_without_blocking(
+    trust_material,
+    target,
+):
+    """Reject named pipes without blocking secure trust loading."""
+
+    (
+        project,
+        config,
+        keys,
+        key_path,
+        expected,
+        registry,
+    ) = trust_material
+
+    registry_path = registry(
+        config / "trust.json",
+        "../keys/public.pem",
+    )
+
+    # Establish that the original trust material is valid.
+    assert trust.load_trusted_key_bytes(
+        registry_path,
+        KEY_ID,
+        SOURCE,
+    ) == expected
+
+    fifo_path = (
+        registry_path
+        if target == "registry"
+        else key_path
+    )
+
+    fifo_path.unlink()
+    os.mkfifo(fifo_path, mode=0o600)
+
+    script = """
+import sys
+from pathlib import Path
+
+from evidence_engine.trust import load_trusted_key_bytes
+
+try:
+    load_trusted_key_bytes(
+        Path(sys.argv[1]),
+        sys.argv[2],
+        sys.argv[3],
+    )
+except ValueError as exc:
+    print(f"REJECTED: {exc}")
+    sys.exit(0)
+
+raise SystemExit(
+    "ERROR: Named pipe was accepted as trust material"
+)
+"""
+
+    repository_root = (
+        Path(__file__).resolve().parents[1]
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(registry_path),
+                KEY_ID,
+                SOURCE,
+            ],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"Secure trust loader blocked while opening "
+            f"a named pipe used as the {target}"
+        )
+
+    assert result.returncode == 0, (
+        result.stdout,
+        result.stderr,
+    )
+
+    assert "REJECTED:" in result.stdout
+
+    assert "regular file" in result.stdout.lower(), (
+        result.stdout,
+        result.stderr,
+    )
