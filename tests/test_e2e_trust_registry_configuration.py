@@ -129,3 +129,103 @@ def test_consume_propagates_configured_registry(
     assert captured["negative_registry"] == registry
     assert captured["negative_key_id"] == "test-value"
     assert calls == [payload, payload]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", " ", "\t", "trust/registry.json"],
+)
+def test_consume_rejects_invalid_override_before_factory(
+    monkeypatch,
+    value,
+):
+    """Invalid explicit configuration must not reach consumer creation."""
+    from scripts import e2e_synthetic_aws as e2e
+
+    for name in (
+        "AWS_REGION",
+        "EVIDENCE_ENGINE_S3_BUCKET",
+        "EVIDENCE_ENGINE_S3_KMS_KEY_ID",
+        "EVIDENCE_ENGINE_SIGNING_KEY_ID",
+        "EVIDENCE_ENGINE_CONSUMER_ID",
+        "EVIDENCE_ENGINE_EXPECTED_STREAM_ID",
+    ):
+        monkeypatch.setenv(name, "test-value")
+
+    monkeypatch.setenv(TRUST_REGISTRY_ENV, value)
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Invalid trust configuration reached consumer execution"
+        )
+
+    monkeypatch.setattr(
+        e2e,
+        "create_consumer",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        e2e,
+        "assert_negative_paths",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        e2e,
+        "assert_dynamodb_rollback_protection",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        e2e,
+        "assert_dynamodb_concurrent_acceptance",
+        unexpected_call,
+    )
+
+    with pytest.raises(ValueError, match=TRUST_REGISTRY_ENV):
+        e2e.consume()
+
+
+@pytest.mark.parametrize(
+    "registry_kind",
+    ["missing", "malformed", "directory"],
+)
+def test_invalid_absolute_override_never_selects_default(
+    monkeypatch,
+    tmp_path: Path,
+    registry_kind,
+):
+    """An invalid absolute override must never select the default."""
+    from scripts import e2e_synthetic_aws as e2e
+
+    default_registry = tmp_path / "default" / "registry.json"
+    default_registry.parent.mkdir()
+    default_registry.write_text(
+        '{"schema_version":"1.0","keys":[]}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        e2e,
+        "TRUST_REGISTRY",
+        default_registry,
+    )
+
+    configured_registry = tmp_path / "configured" / "registry.json"
+    configured_registry.parent.mkdir()
+
+    if registry_kind == "malformed":
+        configured_registry.write_text(
+            "{invalid-json",
+            encoding="utf-8",
+        )
+    elif registry_kind == "directory":
+        configured_registry.mkdir()
+
+    monkeypatch.setenv(
+        TRUST_REGISTRY_ENV,
+        str(configured_registry),
+    )
+
+    selected = configured_trust_registry()
+
+    assert selected == configured_registry
+    assert selected != default_registry

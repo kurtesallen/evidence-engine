@@ -451,3 +451,168 @@ def test_verification_does_not_reopen_resolved_trust_key(
         )
 
     assert len(key_reads) == 0
+
+
+@pytest.mark.parametrize(
+    "registry_kind",
+    [
+        "missing",
+        "malformed",
+        "directory",
+        "unauthorized",
+        "writable",
+        "symlink",
+    ],
+)
+def test_invalid_configured_trust_never_falls_back_or_advances_acceptance(
+    signed_bundle,
+    tmp_path,
+    registry_kind,
+):
+    """Invalid configured trust must fail closed without acceptance."""
+    import os
+
+    if registry_kind in {"writable", "symlink"}:
+        if os.name != "posix":
+            pytest.skip("Requires POSIX filesystem security semantics")
+
+    valid_registry = signed_bundle["trust_registry"]
+
+    # Establish that the original signed evidence is valid.
+    assert verify(signed_bundle) is True
+
+    bundle_root = tmp_path / "trust-regression-published-bundle"
+
+    staged = create_staging_generation(bundle_root)
+    staged.artifacts_root.mkdir()
+
+    for name in sorted(REQUIRED_ARTIFACTS):
+        source = signed_bundle["artifacts"] / name
+        destination = staged.artifacts_root / name
+        destination.write_bytes(source.read_bytes())
+
+    staged.manifest_path.write_bytes(
+        signed_bundle["manifest"].read_bytes()
+    )
+    staged.signature_path.write_bytes(
+        signed_bundle["signature"].read_bytes()
+    )
+
+    published = publish_generation(staged)
+
+    assert resolve_current_generation(bundle_root) == published
+
+    # Keep the invalid registry beside the valid registry so that
+    # relative public-key references retain their original meaning.
+    invalid_registry = (
+        valid_registry.parent
+        / f"invalid-{registry_kind}.json"
+    )
+
+    if registry_kind == "missing":
+        assert not invalid_registry.exists()
+
+    elif registry_kind == "malformed":
+        invalid_registry.write_text(
+            "{invalid-json",
+            encoding="utf-8",
+        )
+
+    elif registry_kind == "directory":
+        invalid_registry.mkdir()
+
+    elif registry_kind == "unauthorized":
+        registry = json.loads(
+            valid_registry.read_text(encoding="utf-8")
+        )
+
+        for key in registry["keys"]:
+            if key["key_id"] == KEY_ID:
+                key["allowed_sources"] = [
+                    "github-actions-claimed"
+                ]
+
+        invalid_registry.write_text(
+            json.dumps(registry),
+            encoding="utf-8",
+        )
+
+    elif registry_kind == "writable":
+        invalid_registry.write_bytes(
+            valid_registry.read_bytes()
+        )
+        invalid_registry.chmod(0o666)
+
+    elif registry_kind == "symlink":
+        invalid_registry.symlink_to(valid_registry)
+
+    else:
+        pytest.fail(
+            f"Unexpected registry kind: {registry_kind}"
+        )
+
+    receipt = {
+        "artifacts_root": str(published.artifacts_root),
+        "manifest_path": str(published.manifest_path),
+        "signature_path": str(published.signature_path),
+        "source": "local-claimed",
+        "artifacts": sorted(REQUIRED_ARTIFACTS),
+        "signature_key_id": KEY_ID,
+
+        # Untrusted receipt metadata must not override the
+        # consumer's explicitly configured trust registry.
+        "trust_registry_path": str(valid_registry),
+    }
+
+    acceptance_state = InMemoryAcceptanceState()
+
+    invalid_consumer = ConsumerAgent(
+        published.artifacts_root,
+        expected_source="local-claimed",
+        expected_key_id=KEY_ID,
+        acceptance_state=acceptance_state,
+        trust_registry_path=invalid_registry,
+        bundle_root=bundle_root,
+    )
+
+    # Real verification must reject the configured invalid registry,
+    # even though the receipt identifies a valid alternative.
+    rejected = invalid_consumer.run(receipt)
+
+    assert rejected.success is False
+    assert rejected.error in {
+        "verification-failed",
+        "verification-error",
+    }, rejected
+
+    # Reconfigure the consumer with the valid trust registry while
+    # preserving the original acceptance state.
+    valid_consumer = ConsumerAgent(
+        published.artifacts_root,
+        expected_source="local-claimed",
+        expected_key_id=KEY_ID,
+        acceptance_state=acceptance_state,
+        trust_registry_path=valid_registry,
+        bundle_root=bundle_root,
+    )
+
+    first_valid = valid_consumer.run(receipt)
+
+    # If the rejected attempt had recorded acceptance, this
+    # legitimate consumption would incorrectly be a replay.
+    assert first_valid.success is True, first_valid
+    assert first_valid.data == {
+        "verified": True,
+        "key_id": KEY_ID,
+    }
+
+    # Normal replay protection must remain operational.
+    replay = valid_consumer.run(receipt)
+
+    assert replay.success is False
+    assert replay.error == "bundle-replay-detected"
+
+    assert (
+        first_valid.audit["bundle_digest"]
+        == replay.audit["bundle_digest"]
+    )
