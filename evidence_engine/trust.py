@@ -652,6 +652,7 @@ def _read_from_pinned_root(
     file_flags = (
         os.O_RDONLY
         | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_BINARY", 0)
     )

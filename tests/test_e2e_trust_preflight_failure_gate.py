@@ -1,47 +1,80 @@
-"""Executable regression tests for the AWS E2E trust preflight gate."""
+"""Executable regression tests for independent E2E trust gates."""
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 WORKFLOW = (
-    Path(__file__).resolve().parents[1]
+    PROJECT_ROOT
     / ".github"
     / "workflows"
     / "evidence-e2e-integration.yml"
 )
 
-PREFLIGHT_STEP = (
-    "Stage trust material and enforce deployment preflight"
-)
-CONSUMER_STEP = (
-    "Verify tampering, trust policy, rollback, concurrency, acceptance, and replay"
+REGISTRY_ENV = "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH"
+
+KEY_A = "synthetic-rotation-key-a"
+KEY_B = "synthetic-rotation-key-b"
+
+STAGE_STEPS = {
+    "produce": (
+        "Stage producer trust material "
+        "and enforce deployment preflight"
+    ),
+    "consume": (
+        "Stage trust material "
+        "and enforce deployment preflight"
+    ),
+}
+
+EXECUTION_STEPS = {
+    "produce": (
+        "Create, sanitize, sign, and upload synthetic bundle"
+    ),
+    "consume": (
+        "Verify tampering, trust policy, rollback, "
+        "concurrency, acceptance, and replay"
+    ),
+}
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix" or shutil.which("bash") is None,
+    reason="Requires POSIX Bash and filesystem permissions",
 )
 
 
 def workflow_script(step_name: str) -> str:
-    """Extract the literal Bash script from a named workflow step."""
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    lines = workflow.splitlines()
+    """Extract the actual Bash script from a named workflow step."""
+    lines = WORKFLOW.read_text(
+        encoding="utf-8"
+    ).splitlines()
 
-    step_marker = f"      - name: {step_name}"
+    marker = f"      - name: {step_name}"
+
     matches = [
-        index for index, line in enumerate(lines)
-        if line == step_marker
+        index
+        for index, line in enumerate(lines)
+        if line == marker
     ]
+
     assert len(matches) == 1, step_name
 
-    start = matches[0]
     run_line = None
 
-    for index in range(start + 1, len(lines)):
+    for index in range(matches[0] + 1, len(lines)):
         line = lines[index]
 
         if line.startswith("      - name: "):
@@ -53,400 +86,497 @@ def workflow_script(step_name: str) -> str:
 
     assert run_line is not None, step_name
 
-    script_lines = []
+    script = []
 
     for line in lines[run_line:]:
         if line and not line.startswith("          "):
             break
-        script_lines.append(line[10:] if line else "")
 
-    assert script_lines
-    return "\n".join(script_lines) + "\n"
+        script.append(line[10:] if line else "")
+
+    assert script
+
+    return "\n".join(script) + "\n"
 
 
-@pytest.mark.skipif(
-    os.name != "posix" or shutil.which("bash") is None,
-    reason="Requires POSIX Bash and filesystem permissions",
-)
-def test_failed_preflight_prevents_consumer_execution(tmp_path: Path):
-    """A failed preflight must not export trust or invoke consumption."""
-    preflight = workflow_script(PREFLIGHT_STEP)
-    consumer = workflow_script(CONSUMER_STEP)
+def write_private(path: Path, content: bytes) -> None:
+    path.write_bytes(content)
+    path.chmod(0o600)
 
-    assert "python -m evidence_engine.trust_preflight" in preflight
-    assert "python scripts/e2e_synthetic_aws.py consume" in consumer
 
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-
-    workspace = tmp_path / "workspace"
-    key_dir = workspace / "trust" / "keys"
-    key_dir.mkdir(parents=True)
-
-    (workspace / "trust" / "registry.json").write_text(
-        '{"schema_version":"1.0","keys":[]}',
-        encoding="utf-8",
+def public_key_bytes() -> bytes:
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
     )
-    (
-        key_dir / "evidence-engine-signing-public.pem"
-    ).write_text("invalid-public-key", encoding="utf-8")
 
-    github_env = tmp_path / "github_env"
-    github_env.touch()
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
 
-    marker = tmp_path / "consumer-invoked"
 
-    # Use a Bash function to intercept Python calls without AWS access.
-    # The preflight fails; any attempted consumer call writes a marker.
-    harness = f"""
-python() {{
-    if [[ "$1 $2" == "-m evidence_engine.trust_preflight" ]]; then
-        return 42
-    fi
-    if [[ "$1 $2" == "scripts/e2e_synthetic_aws.py consume" ]]; then
-        touch "$CONSUMER_MARKER"
-        return 0
-    fi
-    return 99
-}}
+class GateEnvironment:
+    """Isolated synthetic deployment and execution environment."""
 
-{preflight}
-"""
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.chmod(0o700)
 
-    env = os.environ.copy()
-    env.update(
-        {
-            "HOME": str(home),
-            "GITHUB_ENV": str(github_env),
-            "CONSUMER_MARKER": str(marker),
-            "EVIDENCE_ENGINE_SIGNING_KEY_ID": "test-signing-key",
+        self.home = root / "home"
+        self.workspace = root / "workspace"
+        self.trust = self.workspace / "trust"
+        self.keys = self.trust / "keys"
+
+        for directory in (
+            self.home,
+            self.workspace,
+            self.trust,
+            self.keys,
+        ):
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+
+        self.registry = self.trust / "registry.json"
+
+        self.key_a = self.keys / "rotation-a.pem"
+        self.key_b = self.keys / "rotation-b.pem"
+
+        write_private(self.key_a, public_key_bytes())
+        write_private(self.key_b, public_key_bytes())
+
+        self.unreferenced_key = self.keys / "unreferenced.pem"
+
+        write_private(
+            self.unreferenced_key,
+            public_key_bytes(),
+        )
+
+        self.registry_document = {
+            "schema_version": "1.0",
+            "keys": [
+                {
+                    "key_id": KEY_A,
+                    "public_key": "keys/rotation-a.pem",
+                    "status": "retired",
+                    "allowed_sources": [
+                        "github-actions-claimed"
+                    ],
+                },
+                {
+                    "key_id": KEY_B,
+                    "public_key": "keys/rotation-b.pem",
+                    "status": "active",
+                    "allowed_sources": [
+                        "github-actions-claimed"
+                    ],
+                },
+            ],
         }
-    )
-    env.pop("EVIDENCE_ENGINE_TRUST_REGISTRY_PATH", None)
 
-    result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=harness,
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+        self.write_registry()
 
-    assert result.returncode == 42
-    assert github_env.read_text(encoding="utf-8") == ""
-    assert not marker.exists()
+        self.github_env = root / "github_env"
+        self.github_env.touch()
 
-    # Simulate GitHub's next step with only successfully exported
-    # environment values. The required registry path is absent.
-    next_step = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=f"""
-python() {{
-    touch "$CONSUMER_MARKER"
-    return 0
-}}
-{consumer}
-""",
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+        self.marker = root / "execution-marker"
+        self.trace = root / "trust-gate-trace"
 
-    assert next_step.returncode != 0
-    assert not marker.exists()
+        self.env = os.environ.copy()
 
+        for name in (
+            REGISTRY_ENV,
+            "BASH_ENV",
+            "ENV",
+        ):
+            self.env.pop(name, None)
 
-@pytest.mark.skipif(
-    os.name != "posix" or shutil.which("bash") is None,
-    reason="Requires POSIX Bash and filesystem permissions",
-)
-def test_real_preflight_failure_blocks_consumer(tmp_path: Path):
-    """Invalid deployed trust material must block real preflight."""
-    import sys
+        self.env.update(
+            {
+                "HOME": str(self.home),
+                "GITHUB_WORKSPACE": str(self.workspace),
+                "GITHUB_ENV": str(self.github_env),
+                "EXECUTION_MARKER": str(self.marker),
+                "GATE_TRACE": str(self.trace),
+                "EVIDENCE_ENGINE_SIGNING_KEY_ID": KEY_B,
+                "GATE_PYTHON": sys.executable,
+                "PYTHONPATH": str(PROJECT_ROOT),
+                "GATE_SCENARIO": "real",
+            }
+        )
 
-    preflight = workflow_script(PREFLIGHT_STEP)
-    consumer = workflow_script(CONSUMER_STEP)
+    def write_registry(self) -> None:
+        write_private(
+            self.registry,
+            json.dumps(
+                self.registry_document,
+                sort_keys=True,
+            ).encode("utf-8"),
+        )
 
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
+    def run_script(
+        self,
+        script: str,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+            ],
+            input=script,
+            cwd=self.workspace,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
 
-    workspace = tmp_path / "workspace"
-    key_dir = workspace / "trust" / "keys"
-    key_dir.mkdir(parents=True)
+    def stage(
+        self,
+        mode: str,
+        scenario: str = "real",
+    ) -> subprocess.CompletedProcess:
+        env = self.env.copy()
+        env["GATE_SCENARIO"] = scenario
 
-    # Deliberately malformed registry.
-    (workspace / "trust" / "registry.json").write_text(
-        "{invalid-json",
-        encoding="utf-8",
-    )
+        harness = r'''
+python() {
+    case "$1 $2" in
+        "-m evidence_engine.trust_deployment")
+            printf '%s\n' "deployment" >> "$GATE_TRACE"
 
-    (
-        key_dir / "evidence-engine-signing-public.pem"
-    ).write_text(
-        "invalid-public-key",
-        encoding="utf-8",
-    )
+            if [[ "$GATE_SCENARIO" == "stage-failure" ]]; then
+                return 41
+            fi
 
-    github_env = tmp_path / "github_env"
-    github_env.touch()
+            "$GATE_PYTHON" "$@"
 
-    marker = tmp_path / "consumer-invoked"
+            if [[ "$GATE_SCENARIO" == "late-stage-failure" ]]; then
+                return 43
+            fi
 
-    project_root = Path(__file__).resolve().parents[1]
+            return 0
+            ;;
 
-    env = os.environ.copy()
-    env.update(
-        {
-            "HOME": str(home),
-            "GITHUB_ENV": str(github_env),
-            "CONSUMER_MARKER": str(marker),
-            "EVIDENCE_ENGINE_SIGNING_KEY_ID": "test-signing-key",
-            "PREFLIGHT_PYTHON": sys.executable,
-            "PYTHONPATH": str(project_root),
-        }
-    )
+        "-m evidence_engine.trust_preflight")
+            printf '%s\n' "preflight" >> "$GATE_TRACE"
 
-    env.pop("EVIDENCE_ENGINE_TRUST_REGISTRY_PATH", None)
-    env.pop("BASH_ENV", None)
+            if [[ "$GATE_SCENARIO" == "preflight-failure" ]]; then
+                return 42
+            fi
 
-    # Execute the real production preflight module.
-    # Intercept consumption to prevent any AWS interaction.
-    harness = f"""
-python() {{
-    if [[ "$1 $2" == "-m evidence_engine.trust_preflight" ]]; then
-        "$PREFLIGHT_PYTHON" "$@"
-        return $?
+            "$GATE_PYTHON" "$@"
+            return $?
+            ;;
+
+        "scripts/e2e_synthetic_aws.py produce"|"scripts/e2e_synthetic_aws.py consume")
+            touch "$EXECUTION_MARKER"
+            return 97
+            ;;
+
+        *)
+            return 99
+            ;;
+    esac
+}
+'''
+
+        return self.run_script(
+            harness + workflow_script(STAGE_STEPS[mode]),
+            env,
+        )
+
+    def execute(
+        self,
+        mode: str,
+        registry: str | None = None,
+    ) -> subprocess.CompletedProcess:
+        env = self.env.copy()
+        env["EXPECTED_MODE"] = mode
+
+        if registry is not None:
+            env[REGISTRY_ENV] = registry
+
+        harness = r'''
+python() {
+    if [[ "$1" != "scripts/e2e_synthetic_aws.py" ]]; then
+        return 99
     fi
 
-    if [[ "$1 $2" == "scripts/e2e_synthetic_aws.py consume" ]]; then
-        touch "$CONSUMER_MARKER"
-        return 0
+    if [[ "$2" != "$EXPECTED_MODE" ]]; then
+        return 98
     fi
 
-    return 99
-}}
+    printf '%s\n' "$EVIDENCE_ENGINE_TRUST_REGISTRY_PATH" \
+        > "$EXECUTION_MARKER"
 
-{preflight}
-"""
-
-    result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=harness,
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-
-    diagnostics = result.stdout + result.stderr
-
-    assert result.returncode == 1, diagnostics
-    assert "FAIL:" in diagnostics, diagnostics
-    assert "PASS: trust deployment validation succeeded" not in diagnostics
-
-    assert github_env.read_text(encoding="utf-8") == ""
-    assert not marker.exists()
-
-    # Independently verify the consumer's defensive guard.
-    next_step = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=f"""
-python() {{
-    touch "$CONSUMER_MARKER"
     return 0
-}}
+}
+'''
 
-{consumer}
-""",
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
+        return self.run_script(
+            harness + workflow_script(EXECUTION_STEPS[mode]),
+            env,
+        )
 
-    assert next_step.returncode != 0
-    assert not marker.exists()
+    def trace_lines(self) -> list[str]:
+        if not self.trace.exists():
+            return []
 
-
-@pytest.mark.skipif(
-    os.name != "posix" or shutil.which("bash") is None,
-    reason="Requires POSIX Bash and filesystem permissions",
-)
-def test_valid_preflight_allows_consumer_execution(tmp_path: Path):
-    """Valid staged trust must permit the consumer to execute."""
-    import json
-    import sys
-
-    preflight = workflow_script(PREFLIGHT_STEP)
-    consumer = workflow_script(CONSUMER_STEP)
-
-    project_root = Path(__file__).resolve().parents[1]
-
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-
-    # Copy the actual repository trust deployment material.
-    shutil.copytree(
-        project_root / "trust",
-        workspace / "trust",
-    )
-
-    registry = json.loads(
-        (workspace / "trust" / "registry.json").read_text(
+        return self.trace.read_text(
             encoding="utf-8"
+        ).splitlines()
+
+    def exported_lines(self) -> list[str]:
+        return self.github_env.read_text(
+            encoding="utf-8"
+        ).splitlines()
+
+    def assert_blocked(self, mode: str) -> None:
+        assert self.exported_lines() == []
+        assert not self.marker.exists()
+
+        result = self.execute(mode)
+
+        assert result.returncode != 0
+        assert not self.marker.exists()
+
+
+@pytest.fixture
+def gate(tmp_path: Path) -> GateEnvironment:
+    return GateEnvironment(tmp_path)
+
+
+def diagnostics(result: subprocess.CompletedProcess) -> str:
+    return result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_staging_failure_blocks_execution(gate, mode):
+    result = gate.stage(mode, "stage-failure")
+
+    assert result.returncode == 41, diagnostics(result)
+    assert gate.trace_lines() == ["deployment"]
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_late_staging_failure_blocks_execution(gate, mode):
+    """Complete-looking staged files must not authorize execution."""
+    result = gate.stage(mode, "late-stage-failure")
+
+    assert result.returncode == 43, diagnostics(result)
+    assert gate.trace_lines() == ["deployment"]
+
+    staged = list(
+        gate.home.glob(
+            "evidence-engine-trust.*/staged/registry.json"
         )
     )
 
-    authorized_keys = [
-        key
-        for key in registry["keys"]
-        if key["status"] == "active"
-        and "github-actions-claimed" in key["allowed_sources"]
+    assert len(staged) == 1
+
+    registry = staged[0]
+
+    assert registry.read_bytes() == gate.registry.read_bytes()
+
+    for source in (gate.key_a, gate.key_b):
+        target = registry.parent / "keys" / source.name
+
+        assert target.is_file()
+        assert target.read_bytes() == source.read_bytes()
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_preflight_failure_blocks_execution(gate, mode):
+    result = gate.stage(mode, "preflight-failure")
+
+    assert result.returncode == 42, diagnostics(result)
+
+    assert gate.trace_lines() == [
+        "deployment",
+        "preflight",
     ]
 
-    assert len(authorized_keys) == 1
+    gate.assert_blocked(mode)
 
-    signing_key_id = authorized_keys[0]["key_id"]
 
-    github_env = tmp_path / "github_env"
-    github_env.touch()
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_real_malformed_registry_blocks_execution(gate, mode):
+    write_private(gate.registry, b"{invalid-json")
 
-    marker = tmp_path / "consumer-invoked"
+    result = gate.stage(mode)
 
-    env = os.environ.copy()
-    env.update(
-        {
-            "HOME": str(home),
-            "GITHUB_ENV": str(github_env),
-            "CONSUMER_MARKER": str(marker),
-            "EVIDENCE_ENGINE_SIGNING_KEY_ID": signing_key_id,
-            "PREFLIGHT_PYTHON": sys.executable,
-            "PYTHONPATH": str(project_root),
-        }
-    )
+    assert result.returncode == 1, diagnostics(result)
+    assert "FAIL: trust deployment staging:" in diagnostics(result)
 
-    env.pop("EVIDENCE_ENGINE_TRUST_REGISTRY_PATH", None)
-    env.pop("BASH_ENV", None)
+    assert gate.trace_lines() == ["deployment"]
 
-    harness = f"""
-python() {{
-    if [[ "$1 $2" == "-m evidence_engine.trust_preflight" ]]; then
-        "$PREFLIGHT_PYTHON" "$@"
-        return $?
-    fi
+    gate.assert_blocked(mode)
 
-    return 99
-}}
 
-{preflight}
-"""
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_real_revoked_key_blocks_execution(gate, mode):
+    gate.registry_document["keys"][1]["status"] = "revoked"
+    gate.write_registry()
 
-    result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=harness,
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
+    result = gate.stage(mode)
 
-    diagnostics = result.stdout + result.stderr
+    assert result.returncode == 1, diagnostics(result)
+    assert "PASS: trust deployment staging succeeded" in result.stdout
+    assert "FAIL:" in result.stderr
 
-    assert result.returncode == 0, diagnostics
+    assert gate.trace_lines() == [
+        "deployment",
+        "preflight",
+    ]
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_real_unauthorized_source_blocks_execution(gate, mode):
+    gate.registry_document["keys"][1]["allowed_sources"] = [
+        "local-claimed"
+    ]
+
+    gate.write_registry()
+
+    result = gate.stage(mode)
+
+    assert result.returncode == 1, diagnostics(result)
+    assert "PASS: trust deployment staging succeeded" in result.stdout
+    assert "FAIL:" in result.stderr
+
+    assert gate.trace_lines() == [
+        "deployment",
+        "preflight",
+    ]
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_real_missing_expected_key_blocks_execution(gate, mode):
+    gate.env["EVIDENCE_ENGINE_SIGNING_KEY_ID"] = "unknown-key"
+
+    result = gate.stage(mode)
+
+    assert result.returncode == 1, diagnostics(result)
+    assert "PASS: trust deployment staging succeeded" in result.stdout
+    assert "FAIL:" in result.stderr
+
+    assert gate.trace_lines() == [
+        "deployment",
+        "preflight",
+    ]
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_real_missing_referenced_key_blocks_execution(gate, mode):
+    gate.key_a.unlink()
+
+    result = gate.stage(mode)
+
+    assert result.returncode == 1, diagnostics(result)
+    assert "FAIL: trust deployment staging:" in diagnostics(result)
+
+    assert gate.trace_lines() == ["deployment"]
+
+    gate.assert_blocked(mode)
+
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+def test_valid_rotation_deployment_allows_execution(gate, mode):
+    result = gate.stage(mode)
+
+    assert result.returncode == 0, diagnostics(result)
+
+    assert "PASS: trust deployment staging succeeded" in result.stdout
+
     assert (
         "PASS: trust deployment validation succeeded"
-        in diagnostics
+        in result.stdout
     )
-    assert not marker.exists()
 
-    # Verify the workflow exported exactly one registry path.
-    exported = github_env.read_text(
-        encoding="utf-8"
-    ).splitlines()
+    assert gate.trace_lines() == [
+        "deployment",
+        "preflight",
+    ]
+
+    assert not gate.marker.exists()
+
+    exported = gate.exported_lines()
 
     assert len(exported) == 1
 
     name, separator, value = exported[0].partition("=")
 
     assert separator == "="
-    assert name == "EVIDENCE_ENGINE_TRUST_REGISTRY_PATH"
+    assert name == REGISTRY_ENV
 
-    staged_registry = Path(value)
+    registry = Path(value)
 
-    assert staged_registry.is_absolute()
-    assert staged_registry.is_file()
-    assert staged_registry.is_relative_to(home)
-    assert staged_registry.name == "registry.json"
+    assert registry.is_absolute()
+    assert registry.is_relative_to(gate.home)
+    assert registry.name == "registry.json"
+    assert registry.parent.name == "staged"
 
-    staged_root = staged_registry.parent
+    staged_root = registry.parent
     staged_keys = staged_root / "keys"
-    staged_public_key = (
-        staged_keys / "evidence-engine-signing-public.pem"
-    )
 
-    assert staged_public_key.is_file()
+    assert registry.read_bytes() == gate.registry.read_bytes()
 
-    # Confirm private deployment permissions.
-    assert staged_root.stat().st_mode & 0o777 == 0o700
-    assert staged_keys.stat().st_mode & 0o777 == 0o700
-    assert staged_registry.stat().st_mode & 0o777 == 0o600
-    assert staged_public_key.stat().st_mode & 0o777 == 0o600
+    assert {
+        path.name
+        for path in staged_keys.iterdir()
+    } == {
+        "rotation-a.pem",
+        "rotation-b.pem",
+    }
 
-    # Confirm staging preserved the original trust material.
-    assert staged_registry.read_bytes() == (
-        workspace / "trust" / "registry.json"
-    ).read_bytes()
+    for directory in (
+        staged_root.parent,
+        staged_root,
+        staged_keys,
+    ):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
-    assert staged_public_key.read_bytes() == (
-        workspace
-        / "trust"
-        / "keys"
-        / "evidence-engine-signing-public.pem"
-    ).read_bytes()
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
 
-    # Simulate GitHub Actions propagating the exported environment.
-    consumer_env = env.copy()
-    consumer_env[name] = value
+    for source in (gate.key_a, gate.key_b):
+        target = staged_keys / source.name
 
-    next_step = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
-        input=f"""
-python() {{
-    if [[ "$1 $2" == "scripts/e2e_synthetic_aws.py consume" ]]; then
-        printf '%s\\n' "$EVIDENCE_ENGINE_TRUST_REGISTRY_PATH" \
-            > "$CONSUMER_MARKER"
-        return 0
-    fi
+        assert target.read_bytes() == source.read_bytes()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
-    return 99
-}}
+    execution = gate.execute(mode, registry=value)
 
-{consumer}
-""",
-        cwd=workspace,
-        env=consumer_env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
+    assert execution.returncode == 0, diagnostics(execution)
+    assert gate.marker.is_file()
 
-    assert next_step.returncode == 0, (
-        next_step.stdout + next_step.stderr
-    )
+    assert gate.marker.read_text(
+        encoding="utf-8"
+    ).strip() == value
 
-    assert marker.is_file()
-    assert marker.read_text(encoding="utf-8").strip() == value
+
+@pytest.mark.parametrize("mode", ["produce", "consume"])
+@pytest.mark.parametrize("registry", [None, ""])
+def test_execution_requires_exported_registry(gate, mode, registry):
+    result = gate.execute(mode, registry=registry)
+
+    assert result.returncode != 0
+    assert not gate.marker.exists()
+    assert gate.trace_lines() == []
+    assert gate.exported_lines() == []
